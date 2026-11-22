@@ -16,8 +16,16 @@ namespace CSX.LanguageServer
         private readonly System.Collections.Concurrent.ConcurrentDictionary<int, byte> _injectedIds = new();
         private System.Threading.Tasks.TaskCompletionSource<bool>? _projectReady;
         private readonly Dictionary<int, string> _requestUris = new();
+        private readonly Dictionary<string, HashSet<string>> _diagnosticIdentifiers = new(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, HashSet<string>> _pendingDiagnosticRefreshes = new(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, int> _diagnosticGenerations = new(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<int, (string Uri, string Identifier, int Generation)> _diagnosticRequests = new();
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _diagnosticRefreshRequests = new(StringComparer.Ordinal);
         private readonly object _rewriteLock = new();
         private readonly object _pendingReadLock = new();
+        private readonly SemaphoreSlim _clientOutputLock = new(1, 1);
+        private bool _clientSupportsDiagnosticRefresh;
+        private int _nextDiagnosticRefreshRequestId;
 
         // Latest editor buffer for each open source file (LF-normalized). Positions from the
         // client refer to the buffer, which differs from the file on disk while it has unsaved edits.
@@ -147,8 +155,8 @@ namespace CSX.LanguageServer
             }
 
             // Normal pumps for the rest.
-            var c2s = PumpAsync(clientIn, backendIn, true, ct);
-            var s2c = PumpAsync(backendOut, clientOut, false, ct);
+            var c2s = PumpAsync(clientIn, backendIn, true, clientOut, ct);
+            var s2c = PumpAsync(backendOut, clientOut, false, clientOut, ct);
             await Task.WhenAny(c2s, s2c).ConfigureAwait(false);
         }
 
@@ -178,7 +186,7 @@ namespace CSX.LanguageServer
             return (false, await pending.ConfigureAwait(false));
         }
 
-        private async Task PumpAsync(Stream input, Stream output, bool clientToServer, CancellationToken ct)
+        private async Task PumpAsync(Stream input, Stream output, bool clientToServer, Stream clientOutput, CancellationToken ct)
         {
             while (!ct.IsCancellationRequested)
             {
@@ -202,6 +210,16 @@ namespace CSX.LanguageServer
 
                 if (doc == null) break;
 
+                if (clientToServer &&
+                    !doc.RootElement.TryGetProperty("method", out _) &&
+                    doc.RootElement.TryGetProperty("id", out var responseId) &&
+                    responseId.ValueKind == JsonValueKind.String &&
+                    _diagnosticRefreshRequests.TryRemove(responseId.GetString()!, out _))
+                {
+                    doc.Dispose();
+                    continue;
+                }
+
                 // Drop responses to injected warm-up requests so they don't reach the client.
                 if (!clientToServer &&
                     !doc.RootElement.TryGetProperty("method", out _) &&
@@ -223,25 +241,13 @@ namespace CSX.LanguageServer
                 {
                     Console.Error.WriteLine("proxy: " + (clientToServer ? "C->S" : "S->C") + " " + (doc.RootElement.TryGetProperty("method", out var _mm) ? _mm.GetString() : "response id=" + (doc.RootElement.TryGetProperty("id", out var _ii) ? _ii.GetRawText() : "?")) + " | " + doc.RootElement.GetRawText().Substring(0, Math.Min(120, doc.RootElement.GetRawText().Length)));
                     var rewritten = RewriteMessage(doc, clientToServer, out var handledMethod);
-                    await WriteMessageAsync(output, rewritten, ct).ConfigureAwait(false);
-
-                    // didSave regenerates the file on disk; push that text to the C# backend
-                    // as a full didChange so diagnostics refresh without another edit.
-                    if (clientToServer && handledMethod == "textDocument/didSave" &&
-                        rewritten.RootElement.TryGetProperty("params", out var saveParams) &&
-                        saveParams.TryGetProperty("textDocument", out var saveDoc) &&
-                        saveDoc.TryGetProperty("uri", out var saveUriNode))
+                    if (clientToServer)
                     {
-                        var genUri = saveUriNode.GetString();
-                        var genPath = UriToPath(genUri ?? "");
-                        if (File.Exists(genPath))
-                        {
-                            var changeJson = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":" +
-                                             JsonSerializer.Serialize(genUri) + "},\"contentChanges\":[{\"text\":" +
-                                             JsonSerializer.Serialize(File.ReadAllText(genPath)) + "}]}}";
-                            using var change = JsonDocument.Parse(changeJson);
-                            await WriteMessageAsync(output, change, ct).ConfigureAwait(false);
-                        }
+                        await WriteMessageAsync(output, rewritten, ct).ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        await WriteClientMessageAsync(output, rewritten, ct).ConfigureAwait(false);
                     }
 
                     // After the client signals initialized, open the generated project
@@ -255,6 +261,46 @@ namespace CSX.LanguageServer
                             "{\"jsonrpc\":\"2.0\",\"method\":\"project/open\",\"params\":{\"projects\":[\"" + projectUri + "\"]}}");
                         await WriteMessageAsync(output, openProject, ct).ConfigureAwait(false);
                     }
+
+                    if (clientToServer &&
+                        handledMethod == "textDocument/didSave" &&
+                        rewritten.RootElement.TryGetProperty("params", out var saveParams) &&
+                        saveParams.TryGetProperty("textDocument", out var saveDocument) &&
+                        saveDocument.TryGetProperty("uri", out var saveUriNode) &&
+                        saveUriNode.GetString() is string generatedUri)
+                    {
+                        try
+                        {
+                            var generatedPath = UriToPath(generatedUri);
+                            if (File.Exists(generatedPath))
+                            {
+                                var changeJson =
+                                    "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":" +
+                                    JsonSerializer.Serialize(generatedUri) + "},\"contentChanges\":[{\"text\":" +
+                                    JsonSerializer.Serialize(File.ReadAllText(generatedPath)) + "}]}}";
+                                using var change = JsonDocument.Parse(changeJson);
+                                await WriteMessageAsync(output, change, ct).ConfigureAwait(false);
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.Error.WriteLine("csx: could not refresh generated document after save: " + ex.Message);
+                        }
+                    }
+
+                    if (clientToServer &&
+                        _clientSupportsDiagnosticRefresh &&
+                        (handledMethod == "textDocument/didChange" || handledMethod == "textDocument/didSave"))
+                    {
+                        try
+                        {
+                            await RequestDiagnosticRefreshAsync(clientOutput, ct).ConfigureAwait(false);
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.Error.WriteLine("csx: diagnostic refresh request failed: " + ex.Message);
+                        }
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -262,6 +308,156 @@ namespace CSX.LanguageServer
                     await WriteMessageAsync(output, doc, ct).ConfigureAwait(false);
                 }
             }
+        }
+
+        private async Task RequestDiagnosticRefreshAsync(Stream clientOutput, CancellationToken ct)
+        {
+            var requestId = "csx-diagnostic-refresh-" +
+                            System.Threading.Interlocked.Increment(ref _nextDiagnosticRefreshRequestId)
+                                .ToString(System.Globalization.CultureInfo.InvariantCulture);
+            _diagnosticRefreshRequests.TryAdd(requestId, 0);
+
+            using var request = JsonDocument.Parse(
+                "{\"jsonrpc\":\"2.0\",\"id\":" + JsonSerializer.Serialize(requestId) +
+                ",\"method\":\"workspace/diagnostic/refresh\",\"params\":{}}");
+            try
+            {
+                await WriteClientMessageAsync(clientOutput, request, ct).ConfigureAwait(false);
+            }
+            catch
+            {
+                _diagnosticRefreshRequests.TryRemove(requestId, out _);
+                throw;
+            }
+        }
+
+        private async Task WriteClientMessageAsync(Stream clientOutput, JsonDocument doc, CancellationToken ct)
+        {
+            await _clientOutputLock.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+                await WriteMessageAsync(clientOutput, doc, ct).ConfigureAwait(false);
+            }
+            finally
+            {
+                _clientOutputLock.Release();
+            }
+        }
+
+        private void InvalidateDiagnostics(JsonObject message)
+        {
+            if (!TryGetDocumentParams(message, out _, out var uri))
+            {
+                return;
+            }
+
+            if (!_diagnosticIdentifiers.TryGetValue(uri, out var identifiers) || identifiers.Count == 0)
+            {
+                return;
+            }
+
+            var generation = _diagnosticGenerations.TryGetValue(uri, out var previousGeneration)
+                ? previousGeneration + 1
+                : 1;
+            _diagnosticGenerations[uri] = generation;
+            _pendingDiagnosticRefreshes[uri] = new HashSet<string>(identifiers, StringComparer.Ordinal);
+        }
+
+        private void PrepareDiagnosticRequest(JsonObject message)
+        {
+            if (!TryGetDocumentParams(message, out var parameters, out var uri) ||
+                parameters["identifier"] is not JsonValue identifierNode ||
+                !identifierNode.TryGetValue<string>(out var identifier) ||
+                string.IsNullOrEmpty(identifier))
+            {
+                return;
+            }
+
+            if (!_diagnosticIdentifiers.TryGetValue(uri, out var identifiers))
+            {
+                identifiers = new HashSet<string>(StringComparer.Ordinal);
+                _diagnosticIdentifiers[uri] = identifiers;
+            }
+
+            identifiers.Add(identifier);
+            if (!_pendingDiagnosticRefreshes.TryGetValue(uri, out var pending) ||
+                !pending.Contains(identifier))
+            {
+                return;
+            }
+
+            parameters.Remove("previousResultId");
+            if (message["id"] is JsonValue requestIdNode &&
+                requestIdNode.TryGetValue<int>(out var requestId))
+            {
+                var generation = _diagnosticGenerations.TryGetValue(uri, out var currentGeneration)
+                    ? currentGeneration
+                    : 0;
+                _diagnosticRequests[requestId] = (uri, identifier, generation);
+            }
+        }
+
+        private void CompleteDiagnosticRequest(JsonObject message)
+        {
+            if (message["id"] is not JsonValue requestIdNode ||
+                !requestIdNode.TryGetValue<int>(out var requestId) ||
+                !_diagnosticRequests.Remove(requestId, out var request))
+            {
+                return;
+            }
+
+            if (message["result"]?["kind"] is not JsonValue kindNode ||
+                !kindNode.TryGetValue<string>(out var kind) ||
+                kind != "full" ||
+                !_diagnosticGenerations.TryGetValue(request.Uri, out var currentGeneration) ||
+                currentGeneration != request.Generation ||
+                !_pendingDiagnosticRefreshes.TryGetValue(request.Uri, out var pending))
+            {
+                return;
+            }
+
+            pending.Remove(request.Identifier);
+            if (pending.Count == 0)
+            {
+                _pendingDiagnosticRefreshes.Remove(request.Uri);
+            }
+        }
+
+        private void ClearDiagnosticState(JsonObject message)
+        {
+            if (!TryGetDocumentParams(message, out _, out var uri))
+            {
+                return;
+            }
+
+            _diagnosticIdentifiers.Remove(uri);
+            _pendingDiagnosticRefreshes.Remove(uri);
+            _diagnosticGenerations.Remove(uri);
+            foreach (var requestId in _diagnosticRequests
+                         .Where(request => string.Equals(request.Value.Uri, uri, StringComparison.OrdinalIgnoreCase))
+                         .Select(request => request.Key)
+                         .ToArray())
+            {
+                _diagnosticRequests.Remove(requestId);
+            }
+        }
+
+        private static bool TryGetDocumentParams(JsonObject message, out JsonObject parameters, out string uri)
+        {
+            parameters = null!;
+            uri = "";
+            if (message["params"] is not JsonObject paramsObject ||
+                paramsObject["textDocument"] is not JsonObject textDocument ||
+                textDocument["uri"] is not JsonValue uriNode ||
+                !uriNode.TryGetValue<string>(out var value) ||
+                string.IsNullOrEmpty(value))
+            {
+                return false;
+            }
+
+            parameters = paramsObject;
+            uri = value;
+            return true;
         }
 
         public static async Task<JsonDocument?> ReadMessageAsync(Stream stream, CancellationToken ct)
@@ -349,6 +545,11 @@ namespace CSX.LanguageServer
                 ? parsedMethod
                 : null;
 
+            if (clientToServer && methodName == "initialize")
+            {
+                _clientSupportsDiagnosticRefresh = HasDiagnosticRefreshSupport(node);
+            }
+
             // Force full-document sync so the proxy can transform whole documents
             // instead of having to replay incremental edits.
             if (!clientToServer)
@@ -382,8 +583,49 @@ namespace CSX.LanguageServer
 
             RewriteNode(node, clientToServer, null, methodName);
 
+            if (node is JsonObject messageObject)
+            {
+                if (clientToServer && methodName == "textDocument/didClose")
+                {
+                    ClearDiagnosticState(messageObject);
+                }
+                else if (clientToServer &&
+                         (methodName == "textDocument/didChange" || methodName == "textDocument/didSave"))
+                {
+                    InvalidateDiagnostics(messageObject);
+                }
+                else if (clientToServer && methodName == "textDocument/diagnostic")
+                {
+                    PrepareDiagnosticRequest(messageObject);
+                }
+                else if (!clientToServer && methodName == null)
+                {
+                    CompleteDiagnosticRequest(messageObject);
+                }
+
+                if (!clientToServer &&
+                    !messageObject.ContainsKey("method") &&
+                    messageObject["id"] is JsonValue responseIdNode &&
+                    responseIdNode.TryGetValue<int>(out var responseId))
+                {
+                    _requestUris.Remove(responseId);
+                }
+            }
+
             var newJson = node.ToJsonString();
             return JsonDocument.Parse(newJson);
+        }
+
+        private static bool HasDiagnosticRefreshSupport(JsonNode? message)
+        {
+            return message is JsonObject root &&
+                   root["params"] is JsonObject parameters &&
+                   parameters["capabilities"] is JsonObject capabilities &&
+                   capabilities["workspace"] is JsonObject workspace &&
+                   workspace["diagnostics"] is JsonObject diagnostics &&
+                   diagnostics["refreshSupport"] is JsonValue refreshSupport &&
+                   refreshSupport.TryGetValue<bool>(out var supported) &&
+                   supported;
         }
 
         private void RewriteNode(JsonNode? node, bool clientToServer, string? currentUri, string? methodName)
@@ -436,6 +678,15 @@ namespace CSX.LanguageServer
                     if (reqUri != null) _requestUris[ridInt] = reqUri;
                 }
 
+                if (clientToServer &&
+                    methodName == "textDocument/didOpen" &&
+                    uri != null &&
+                    uri.EndsWith(".generated.cs", StringComparison.OrdinalIgnoreCase) &&
+                    obj.ContainsKey("languageId"))
+                {
+                    obj["languageId"] = "csharp";
+                }
+
                 if (clientToServer && methodName == "textDocument/didClose" && uri != null &&
                     uri.EndsWith(".generated.cs", StringComparison.OrdinalIgnoreCase))
                 {
@@ -473,26 +724,47 @@ namespace CSX.LanguageServer
                     foreach (var item in ccArr)
                     {
                         if (item is not JsonObject co) continue;
-                        if (co.ContainsKey("range")) continue;
-                        if (co.TryGetPropertyValue("text", out var tNode) && tNode is JsonValue tv2 && tv2.TryGetValue<string>(out var ct))
+                        if (!co.TryGetPropertyValue("text", out var tNode) ||
+                            tNode is not JsonValue tv2 ||
+                            !tv2.TryGetValue<string>(out var ct))
                         {
-                            if (uri != null && uri.EndsWith(".generated.cs", StringComparison.OrdinalIgnoreCase))
-                            {
-                                var genPath = UriToPath(uri);
-                                var changedOrigPath = GetOriginalPath(uri);
-                                if (changedOrigPath.EndsWith(_options.FileExtension, StringComparison.OrdinalIgnoreCase))
-                                    _openText[changedOrigPath] = NormalizeLineEndings(ct);
-                                WriteGenerated(genPath, changedOrigPath, ct);
-                                co["text"] = File.ReadAllText(genPath);
-                            }
-                            else if (uri != null && uri.EndsWith(_options.FileExtension, StringComparison.OrdinalIgnoreCase))
-                            {
-                                var origPath = UriToPath(uri);
-                                var genPath = GetGeneratedPath(origPath);
-                                WriteGenerated(genPath, origPath, ct);
-                                co["text"] = File.ReadAllText(genPath);
-                            }
+                            continue;
                         }
+
+                        if (uri == null) continue;
+
+                        string originalPath;
+                        string generatedPath;
+                        if (uri.EndsWith(".generated.cs", StringComparison.OrdinalIgnoreCase))
+                        {
+                            generatedPath = UriToPath(uri);
+                            originalPath = GetOriginalPath(uri);
+                        }
+                        else if (uri.EndsWith(_options.FileExtension, StringComparison.OrdinalIgnoreCase))
+                        {
+                            originalPath = UriToPath(uri);
+                            generatedPath = GetGeneratedPath(originalPath);
+                        }
+                        else
+                        {
+                            continue;
+                        }
+
+                        string source = ReadOriginalText(originalPath);
+                        if (co.TryGetPropertyValue("range", out var rangeNode) && rangeNode is JsonObject range)
+                        {
+                            source = ApplyTextChange(source, range, ct);
+                        }
+                        else
+                        {
+                            source = NormalizeLineEndings(ct);
+                        }
+
+                        _openText[originalPath] = source;
+                        WriteGenerated(generatedPath, originalPath, source);
+                        co["text"] = File.ReadAllText(generatedPath);
+                        co.Remove("range");
+                        co.Remove("rangeLength");
                     }
                 }
 
@@ -525,13 +797,47 @@ namespace CSX.LanguageServer
                     }
                     else
                     {
-                        ConvertPosition((JsonObject)obj["start"]!, clientToServer, uri ?? currentUri, false);
-                        ConvertPosition((JsonObject)obj["end"]!, clientToServer, uri ?? currentUri, true);
+                        ConvertRangeToGenerated((JsonObject)obj["start"]!, (JsonObject)obj["end"]!, uri ?? currentUri);
                     }
+
+                    return;
                 }
 
                 foreach (var kv in obj.ToList())
                 {
+                    if (kv.Key == "changes" && kv.Value is JsonObject workspaceChanges)
+                    {
+                        var rewrittenChanges = new JsonObject();
+                        foreach (var change in workspaceChanges)
+                        {
+                            var changeUri = clientToServer
+                                ? GetGeneratedUri(change.Key)
+                                : GetOriginalUri(change.Key);
+                            var edits = change.Value?.DeepClone();
+                            RewriteNode(edits, clientToServer, changeUri, methodName);
+
+                            if (rewrittenChanges.TryGetPropertyValue(changeUri, out var existingEdits))
+                            {
+                                if (existingEdits is not JsonArray existingArray || edits is not JsonArray newArray)
+                                {
+                                    throw new InvalidOperationException($"Conflicting workspace edits for '{changeUri}'.");
+                                }
+
+                                foreach (var edit in newArray)
+                                {
+                                    existingArray.Add(edit?.DeepClone());
+                                }
+                            }
+                            else
+                            {
+                                rewrittenChanges[changeUri] = edits;
+                            }
+                        }
+
+                        obj[kv.Key] = rewrittenChanges;
+                        continue;
+                    }
+
                     RewriteNode(kv.Value, clientToServer, uri, methodName);
                 }
             }
@@ -680,6 +986,48 @@ namespace CSX.LanguageServer
             end["character"] = mappedEndChar;
         }
 
+        private void ConvertRangeToGenerated(JsonObject start, JsonObject end, string? uri)
+        {
+            if (uri == null ||
+                !int.TryParse(start["line"]?.ToString(), out var startLine) ||
+                !int.TryParse(start["character"]?.ToString(), out var startChar) ||
+                !int.TryParse(end["line"]?.ToString(), out var endLine) ||
+                !int.TryParse(end["character"]?.ToString(), out var endChar))
+            {
+                return;
+            }
+
+            var generatedPath = UriToPath(uri);
+            var originalPath = GetOriginalPath(uri);
+            if (!originalPath.EndsWith(_options.FileExtension, StringComparison.OrdinalIgnoreCase)) return;
+
+            _resolver.Load(generatedPath);
+            string originalText = ReadOriginalText(originalPath);
+            string generatedText = NormalizeLineEndings(File.Exists(generatedPath) ? File.ReadAllText(generatedPath) : "");
+
+            int originalStart = PositionToOffset(originalText, startLine, startChar);
+            int originalEnd = PositionToOffset(originalText, endLine, endChar);
+            if (originalEnd < originalStart)
+            {
+                throw new InvalidOperationException("Received a range whose end precedes its start.");
+            }
+
+            int generatedStart = _resolver.ToGenerated(generatedPath, originalStart);
+            int generatedEnd = _resolver.ToGenerated(generatedPath, originalEnd);
+            if (generatedEnd < generatedStart)
+            {
+                Console.Error.WriteLine($"Non-monotonic source-map range for {uri}: {generatedStart}..{generatedEnd}; ordering mapped boundaries.");
+                (generatedStart, generatedEnd) = (generatedEnd, generatedStart);
+            }
+
+            var (mappedStartLine, mappedStartChar) = OffsetToPosition(generatedText, generatedStart);
+            var (mappedEndLine, mappedEndChar) = OffsetToPosition(generatedText, generatedEnd);
+            start["line"] = mappedStartLine;
+            start["character"] = mappedStartChar;
+            end["line"] = mappedEndLine;
+            end["character"] = mappedEndChar;
+        }
+
         private string ReadOriginalText(string originalPath)
         {
             if (_openText.TryGetValue(originalPath, out var open)) return open;
@@ -698,8 +1046,31 @@ namespace CSX.LanguageServer
             for (int i = 0; i < line; i++) offset += lines[i].Length + 1;
             int lineLen = lines[line].Length;
             if (lineLen > 0 && lines[line][lineLen - 1] == '\r') lineLen--;
-            int col = Math.Min(character, lineLen);
-            return Math.Min(offset + col, text.Length);
+            int col = Math.Clamp(character, 0, lineLen);
+            return Math.Clamp(offset + col, 0, text.Length);
+        }
+
+        private static string ApplyTextChange(string source, JsonObject range, string replacement)
+        {
+            if (range["start"] is not JsonObject start || range["end"] is not JsonObject end ||
+                !int.TryParse(start["line"]?.ToString(), out int startLine) ||
+                !int.TryParse(start["character"]?.ToString(), out int startCharacter) ||
+                !int.TryParse(end["line"]?.ToString(), out int endLine) ||
+                !int.TryParse(end["character"]?.ToString(), out int endCharacter))
+            {
+                throw new InvalidOperationException("Received a text change with an invalid range.");
+            }
+
+            int startOffset = PositionToOffset(source, startLine, startCharacter);
+            int endOffset = PositionToOffset(source, endLine, endCharacter);
+            if (endOffset < startOffset)
+            {
+                throw new InvalidOperationException("Received a text change whose end precedes its start.");
+            }
+
+            return source.Substring(0, startOffset) +
+                   NormalizeLineEndings(replacement) +
+                   source.Substring(endOffset);
         }
 
         private static (int Line, int Character) OffsetToPosition(string text, int offset)

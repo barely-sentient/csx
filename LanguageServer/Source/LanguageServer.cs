@@ -126,8 +126,10 @@ namespace CSX.LanguageServer
             try
             {
                 var root = _options.ProjectRoot;
-                var outputDir = Path.Combine(root, _options.OutputDirectory);
+                var outputDir = Path.GetFullPath(Path.Combine(root, _options.OutputDirectory));
+                var projectDir = Path.Combine(root, "obj", "csx-project");
                 Directory.CreateDirectory(outputDir);
+                Directory.CreateDirectory(projectDir);
 
                 // Detect TFM and package references from existing csproj files.
                 string tfm = "net10.0";
@@ -138,11 +140,20 @@ namespace CSX.LanguageServer
                     if (ct.IsCancellationRequested) break;
                     var rel = Path.GetRelativePath(root, csproj);
                     if (rel.Split(Path.DirectorySeparatorChar).Any(s => s.Equals("bin", StringComparison.OrdinalIgnoreCase) || s.Equals("obj", StringComparison.OrdinalIgnoreCase))) continue;
+                    if (Path.GetFullPath(csproj).StartsWith(
+                        outputDir.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar,
+                        StringComparison.OrdinalIgnoreCase)) continue;
                     try
                     {
                         var doc = System.Xml.Linq.XDocument.Load(csproj);
                         var tfmNode = doc.Descendants().FirstOrDefault(e => e.Name.LocalName == "TargetFramework" || e.Name.LocalName == "TargetFrameworks");
-                        if (tfmNode != null && !string.IsNullOrWhiteSpace(tfmNode.Value)) tfm = tfmNode.Value.Split(';').First().Trim();
+                        var candidateTfm = tfmNode?.Value.Trim();
+                        if (!string.IsNullOrWhiteSpace(candidateTfm) &&
+                            !candidateTfm.Contains("$(", StringComparison.Ordinal) &&
+                            !candidateTfm.Contains("@(", StringComparison.Ordinal))
+                        {
+                            tfm = candidateTfm.Split(';').First().Trim();
+                        }
                         foreach (var pr in doc.Descendants().Where(e => e.Name.LocalName == "PackageReference"))
                         {
                             var inc = pr.Attribute("Include")?.Value;
@@ -161,7 +172,7 @@ namespace CSX.LanguageServer
                     catch { }
                 }
 
-                var csprojPath = Path.Combine(outputDir, "CSX.Generated.csproj");
+                var csprojPath = Path.Combine(projectDir, "CSX.Generated.csproj");
                 _options.GeneratedProjectPath = csprojPath;
 
                 var sb = new StringBuilder();
@@ -174,12 +185,13 @@ namespace CSX.LanguageServer
                 sb.AppendLine("    <OutputType>Library</OutputType>");
                 sb.AppendLine("  </PropertyGroup>");
                 sb.AppendLine("  <ItemGroup>");
-                sb.AppendLine("    <Compile Include=\"**/*.generated.cs\" />");
+                var generatedRel = Path.GetRelativePath(projectDir, outputDir).Replace('\\', '/').TrimEnd('/');
+                sb.AppendLine($"    <Compile Include=\"{generatedRel}/**/*.generated.cs\" />");
                 // Include real .cs files from the project root, excluding bin/obj and the output dir.
                 // The root is located relative to the generated project, whatever depth the output
                 // directory has, and the output directory is excluded so generated files are not
                 // compiled twice (a duplicate Compile item is a build error).
-                var up = Path.GetRelativePath(outputDir, root).Replace('\\', '/').TrimEnd('/');
+                var up = Path.GetRelativePath(projectDir, root).Replace('\\', '/').TrimEnd('/');
                 var outRel = Path.GetRelativePath(root, outputDir).Replace('\\', '/').TrimEnd('/');
                 sb.AppendLine($"    <Compile Include=\"{up}/**/*.cs\" Exclude=\"{up}/bin/**;{up}/obj/**;{up}/**/bin/**;{up}/**/obj/**;{up}/**/Debug/**;{up}/**/Release/**;{up}/{outRel}/**\" />");
                 sb.AppendLine("  </ItemGroup>");
@@ -200,6 +212,31 @@ namespace CSX.LanguageServer
                         sb.AppendLine($"    <FrameworkReference Include=\"{fr}\" />");
                     }
                     sb.AppendLine("  </ItemGroup>");
+                }
+
+                var appAssemblyName = Path.GetFileName(root.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+                var referencedAssemblies = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var configuration in new[] { "Debug", "Release" })
+                {
+                    var referenceDir = Path.Combine(root, "bin", configuration, tfm);
+                    if (!Directory.Exists(referenceDir)) continue;
+
+                    foreach (var dll in Directory.EnumerateFiles(referenceDir, "*.dll"))
+                    {
+                        var name = Path.GetFileName(dll);
+                        if (string.Equals(name, appAssemblyName + ".dll", StringComparison.OrdinalIgnoreCase) ||
+                            !referencedAssemblies.Add(name))
+                        {
+                            continue;
+                        }
+
+                        var escapedPath = System.Security.SecurityElement.Escape(dll) ?? dll;
+                        sb.AppendLine("  <ItemGroup>");
+                        sb.AppendLine($"    <Reference Include=\"{Path.GetFileNameWithoutExtension(dll)}\">");
+                        sb.AppendLine($"      <HintPath>{escapedPath}</HintPath>");
+                        sb.AppendLine("    </Reference>");
+                        sb.AppendLine("  </ItemGroup>");
+                    }
                 }
 
                 sb.AppendLine("</Project>");
@@ -968,9 +1005,9 @@ namespace CSX.LanguageServer
                     nullableContextOptions: NullableContextOptions.Enable));
         }
 
-        private static List<MetadataReference>? _metadataReferences;
+        private List<MetadataReference>? _metadataReferences;
 
-        private static List<MetadataReference> GetMetadataReferences()
+        private List<MetadataReference> GetMetadataReferences()
         {
             if (_metadataReferences != null)
             {
@@ -978,16 +1015,43 @@ namespace CSX.LanguageServer
             }
 
             var references = new List<MetadataReference>();
-            var runtimeDirectory = System.Runtime.InteropServices.RuntimeEnvironment.GetRuntimeDirectory();
-            foreach (var dll in Directory.EnumerateFiles(runtimeDirectory, "*.dll"))
+            var identities = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            void AddReference(string path)
             {
                 try
                 {
-                    references.Add(MetadataReference.CreateFromFile(dll));
+                    var identity = System.Reflection.AssemblyName.GetAssemblyName(path).FullName;
+                    if (identity != null && !identities.Add(identity))
+                    {
+                        return;
+                    }
+
+                    references.Add(MetadataReference.CreateFromFile(path));
                 }
-                catch
+                catch (BadImageFormatException)
                 {
-                    // Not a managed assembly.
+                }
+                catch (IOException)
+                {
+                }
+                catch (UnauthorizedAccessException)
+                {
+                }
+            }
+
+            var runtimeDirectory = System.Runtime.InteropServices.RuntimeEnvironment.GetRuntimeDirectory();
+            foreach (var dll in Directory.EnumerateFiles(runtimeDirectory, "*.dll"))
+            {
+                AddReference(dll);
+            }
+
+            var projectOutput = Path.Combine(_options.ProjectRoot, "bin");
+            if (Directory.Exists(projectOutput))
+            {
+                foreach (var dll in Directory.EnumerateFiles(projectOutput, "*.dll", SearchOption.AllDirectories))
+                {
+                    AddReference(dll);
                 }
             }
 

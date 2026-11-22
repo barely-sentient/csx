@@ -246,11 +246,17 @@ namespace CSX.Transformer
             }
 
             string tagMethodUsed = isComponent ? componentMethod : tagMethod;
+            bool omitEmptyComponentProps = isComponent && selfClosing && attrCount == 0;
             var result = new StringBuilder();
             if (isComponent)
             {
                 result.Append(cls).Append('.').Append(tagMethodUsed)
-                      .Append('<').Append(tagName).Append(genericText).Append(", ").Append(tagName).Append("Props>")
+                      .Append('<').Append(tagName).Append(genericText);
+                if (!omitEmptyComponentProps)
+                {
+                    result.Append(", ").Append(tagName).Append("Props");
+                }
+                result.Append('>')
                       .Append('(');
             }
             else
@@ -285,7 +291,7 @@ namespace CSX.Transformer
                 }
                 result.Append(attrBuilder).Append(" }");
             }
-            else
+            else if (!omitEmptyComponentProps)
             {
                 result.Append(isComponent ? "new() { }" : ", new() { }");
             }

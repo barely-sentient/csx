@@ -53,6 +53,15 @@ public class TransformerTests
     }
 
     [Fact]
+    public void ComponentWithoutPropsDoesNotRequirePropsType()
+    {
+        var source = "return <Header />;";
+        var result = new Transformer().Transform(source);
+        Assert.Contains("_.C<Header>()", result);
+        Assert.DoesNotContain("HeaderProps", result);
+    }
+
+    [Fact]
     public void CustomConfig()
     {
         var cfg = new TransformConfig
