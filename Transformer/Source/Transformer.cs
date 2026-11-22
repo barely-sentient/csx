@@ -7,17 +7,21 @@ namespace CSX.Transformer
     {
         public string Transform(string source, TransformConfig? config = null)
         {
-            return TransformWithSourceMap(source, Tokenizer.Tokenize(source), config).Text;
+            return TransformWithSourceMap(source, config).Text;
         }
 
         public (string Text, SourceMap Map) TransformWithSourceMap(string source, TransformConfig? config = null)
         {
+            // Generated output always uses LF. Normalize first so source-map offsets stay aligned
+            // with the generated offsets; CRLF input otherwise shifts every mapping by one per line.
+            source = NormalizeLineEndings(source);
             var tokens = Tokenizer.Tokenize(source);
             return TransformWithSourceMap(source, tokens, config);
         }
 
         public (string Text, SourceMap Map) TransformWithSourceMap(string source, List<Token> tokens, TransformConfig? config = null)
         {
+            source = NormalizeLineEndings(source);
             config ??= new TransformConfig();
             var sb = new StringBuilder();
             var map = new SourceMap { SourceFile = null, GeneratedFile = null };
@@ -42,8 +46,10 @@ namespace CSX.Transformer
                     int origStart = t.StartPosition;
                     string element = TransformElement(source, tokens, ref i, config, map, genStart, origStart);
                     sb.Append(element);
-                    int origEnd = i > 0 ? tokens[i - 1].StartPosition + tokens[i - 1].Length : origStart;
-                    map.Add(genStart, element.Length, origStart, origEnd - origStart);
+                    // The generated element is heavily rewritten. Anchor the whole element
+                    // mapping to the original '<' only; specific sub-mappings below handle
+                    // tag names and the framework marker.
+                    map.Add(genStart, element.Length, origStart, 1);
                     if (i > 0 && i - 1 < tokens.Count)
                     {
                         pos = tokens[i - 1].StartPosition + tokens[i - 1].Length;
@@ -81,25 +87,40 @@ namespace CSX.Transformer
             // i at JsxOpenBracket
             i++; // consume <
 
+            var cls = config.FrameworkHtmlClass;
+            var tagMethod = config.FrameworkHtmlClassMethod;
+            var componentMethod = config.FrameworkComponentMethod;
+            var fragmentMethod = config.FrameworkFragmentMethod;
+
             // fragment <>
             if (i < count && tokens[i].Kind == TokenKind.JsxCloseBracket)
             {
                 i++; // consume >
-                var fragChildren = new List<string>();
+                var fragResult = new StringBuilder();
+                fragResult.Append(cls).Append('.').Append(fragmentMethod).Append('(');
+                AddFrameworkMarkerMapping(map, genBase, origBase, fragResult.Length);
+
+                bool hasFragChild = false;
                 while (i < count && tokens[i].Kind != TokenKind.JsxCloseTagOpen)
                 {
                     if (tokens[i].Kind == TokenKind.JsxText)
                     {
-                        fragChildren.Add(QuoteText(tokens[i].Text ?? ""));
+                        if (hasFragChild) fragResult.Append(", ");
+                        fragResult.Append(QuoteText(tokens[i].Text ?? ""));
                         i++;
+                        hasFragChild = true;
                     }
                     else if (tokens[i].Kind == TokenKind.OpenBrace)
                     {
-                        fragChildren.Add(TransformBraced(source, tokens, ref i, config));
+                        if (hasFragChild) fragResult.Append(", ");
+                        fragResult.Append(TransformBraced(source, tokens, ref i, config, map, genBase + fragResult.Length, tokens[i].StartPosition));
+                        hasFragChild = true;
                     }
                     else if (tokens[i].Kind == TokenKind.JsxOpenBracket)
                     {
-                        fragChildren.Add(TransformElement(source, tokens, ref i, config));
+                        if (hasFragChild) fragResult.Append(", ");
+                        fragResult.Append(TransformElement(source, tokens, ref i, config, map, genBase + fragResult.Length, tokens[i].StartPosition));
+                        hasFragChild = true;
                     }
                     else
                     {
@@ -114,26 +135,17 @@ namespace CSX.Transformer
                     if (i < count && tokens[i].Kind == TokenKind.JsxCloseBracket) i++;
                 }
 
-                var cls = config.FrameworkHtmlClass;
-                var fragMethod = config.FrameworkFragmentMethod;
-                var sb = new StringBuilder();
-                sb.Append(cls).Append('.').Append(fragMethod).Append('(');
-                if (fragChildren.Count > 0)
-                {
-                    sb.Append(string.Join(", ", fragChildren));
-                }
-                sb.Append(')');
-                return sb.ToString();
+                fragResult.Append(')');
+                return fragResult.ToString();
             }
 
             bool isComponent = false;
             string tagName = "";
-             int origTagNameStart = -1;
+            int origTagNameStart = -1;
             if (i < count && tokens[i].Kind == TokenKind.JsxComponentName)
             {
                 isComponent = true;
                 tagName = tokens[i].Text ?? "";
-                 origTagNameStart = tokens[i].StartPosition;
                 origTagNameStart = tokens[i].StartPosition;
                 i++;
             }
@@ -191,64 +203,75 @@ namespace CSX.Transformer
                 i++;
             }
 
-            string clsName = config.FrameworkHtmlClass;
-            string tagMethod = isComponent ? config.FrameworkComponentMethod : config.FrameworkHtmlClassMethod;
-
-            if (selfClosing)
+            string tagMethodUsed = isComponent ? componentMethod : tagMethod;
+            var result = new StringBuilder();
+            if (isComponent)
             {
-                var sb = new StringBuilder();
-                if (isComponent)
-                {
-                    sb.Append(clsName).Append('.').Append(tagMethod)
+                result.Append(cls).Append('.').Append(tagMethodUsed)
                       .Append('<').Append(tagName).Append(genericText).Append(", ").Append(tagName).Append("Props>")
                       .Append('(');
-                    if (attrs.Count > 0)
-                    {
-                        sb.Append("new() { ").Append(string.Join(", ", attrs)).Append(" }");
-                    }
-                    else
-                    {
-                        sb.Append("new() { }");
-                    }
-                    sb.Append(')');
+            }
+            else
+            {
+                result.Append(cls).Append('.').Append(tagMethodUsed).Append('(').Append(Quote(tagName));
+            }
+
+            // Roslyn reports a missing framework class/method on the generated marker. Anchor
+            // that range to the original '<' so .cx shows the error exactly on the JSX bracket.
+            AddFrameworkMarkerMapping(map, genBase, origBase, result.Length);
+            if (map != null && origTagNameStart >= 0 && tagName.Length > 0)
+            {
+                int genOffset = isComponent
+                    ? cls.Length + 1 + tagMethodUsed.Length + 1
+                    : cls.Length + 1 + tagMethodUsed.Length + 2;
+                map.Add(genBase + genOffset, tagName.Length, origTagNameStart, tagName.Length);
+            }
+
+            if (attrs.Count > 0)
+            {
+                if (isComponent)
+                {
+                    result.Append("new() { ").Append(string.Join(", ", attrs)).Append(" }");
                 }
                 else
                 {
-                    sb.Append(clsName).Append('.').Append(tagMethod).Append('(').Append(Quote(tagName));
-                    if (attrs.Count > 0)
-                    {
-                        sb.Append(", new() { ").Append(string.Join(", ", attrs)).Append(" }");
-                    }
-                    else
-                    {
-                        sb.Append(", new() { }");
-                    }
-                    sb.Append(')');
+                    result.Append(", new() { ").Append(string.Join(", ", attrs)).Append(" }");
                 }
-                if (map != null && origTagNameStart >= 0 && tagName.Length > 0)
-                {
-                    int genOffset = isComponent ? 3 : 4;
-                    map.Add(genBase + genOffset, tagName.Length, origTagNameStart, tagName.Length);
-                }
-                return sb.ToString();
+            }
+            else
+            {
+                result.Append(isComponent ? "new() { }" : ", new() { }");
             }
 
-            // children
-            var children = new List<string>();
+            if (selfClosing)
+            {
+                result.Append(')');
+                return result.ToString();
+            }
+
+            // The attribute object has already been emitted as an argument, so the first
+            // child must be comma-separated even when there are no attributes.
+            bool hasChild = true;
             while (i < count && tokens[i].Kind != TokenKind.JsxCloseTagOpen)
             {
                 if (tokens[i].Kind == TokenKind.JsxText)
                 {
-                    children.Add(QuoteText(tokens[i].Text ?? ""));
+                    if (hasChild) result.Append(", ");
+                    result.Append(QuoteText(tokens[i].Text ?? ""));
                     i++;
+                    hasChild = true;
                 }
                 else if (tokens[i].Kind == TokenKind.OpenBrace)
                 {
-                    children.Add(TransformBraced(source, tokens, ref i, config));
+                    if (hasChild) result.Append(", ");
+                    result.Append(TransformBraced(source, tokens, ref i, config, map, genBase + result.Length, tokens[i].StartPosition));
+                    hasChild = true;
                 }
                 else if (tokens[i].Kind == TokenKind.JsxOpenBracket)
                 {
-                    children.Add(TransformElement(source, tokens, ref i, config));
+                    if (hasChild) result.Append(", ");
+                    result.Append(TransformElement(source, tokens, ref i, config, map, genBase + result.Length, tokens[i].StartPosition));
+                    hasChild = true;
                 }
                 else
                 {
@@ -264,44 +287,14 @@ namespace CSX.Transformer
                 if (i < count && tokens[i].Kind == TokenKind.JsxCloseBracket) i++;
             }
 
-            var result = new StringBuilder();
-            if (isComponent)
-            {
-                result.Append(clsName).Append('.').Append(tagMethod)
-                      .Append('<').Append(tagName).Append(genericText).Append(", ").Append(tagName).Append("Props>")
-                      .Append('(');
-                if (attrs.Count > 0)
-                {
-                    result.Append("new() { ").Append(string.Join(", ", attrs)).Append(" }");
-                }
-                else
-                {
-                    result.Append("new() { }");
-                }
-            }
-            else
-            {
-                result.Append(clsName).Append('.').Append(tagMethod).Append('(').Append(Quote(tagName));
-                if (attrs.Count > 0)
-                {
-                    result.Append(", new() { ").Append(string.Join(", ", attrs)).Append(" }");
-                }
-                else
-                {
-                    result.Append(", new() { }");
-                }
-            }
-            foreach (var child in children)
-            {
-                result.Append(", ").Append(child);
-            }
             result.Append(')');
-            if (map != null && origTagNameStart >= 0 && tagName.Length > 0)
-            {
-                int genOffset = isComponent ? 3 : 4;
-                map.Add(genBase + genOffset, tagName.Length, origTagNameStart, tagName.Length);
-            }
             return result.ToString();
+        }
+
+        private static void AddFrameworkMarkerMapping(SourceMap? map, int genBase, int origBase, int prefixLength)
+        {
+            if (map == null || origBase < 0 || prefixLength <= 0) return;
+            map.Add(genBase, prefixLength, origBase, 1);
         }
 
         private static string ParseAttributeValue(string source, List<Token> tokens, ref int i, TransformConfig config)
@@ -331,7 +324,7 @@ namespace CSX.Transformer
             return fallback;
         }
 
-        private static string TransformBraced(string source, List<Token> tokens, ref int i, TransformConfig config)
+        private static string TransformBraced(string source, List<Token> tokens, ref int i, TransformConfig config, SourceMap? map = null, int genBase = 0, int origBase = 0)
         {
             int count = tokens.Count;
             if (i >= count || tokens[i].Kind != TokenKind.OpenBrace) return "";
@@ -365,7 +358,7 @@ namespace CSX.Transformer
                 }
                 else if (t.Kind == TokenKind.JsxOpenBracket)
                 {
-                    string elem = TransformElement(source, tokens, ref i, config);
+                    string elem = TransformElement(source, tokens, ref i, config, map, genBase + sb.Length, t.StartPosition);
                     sb.Append(elem);
                     if (i > 0 && i - 1 < tokens.Count)
                     {
@@ -398,5 +391,8 @@ namespace CSX.Transformer
             value = value.Trim();
             return Quote(value);
         }
+
+        private static string NormalizeLineEndings(string source) =>
+            source.Replace("\r\n", "\n").Replace('\r', '\n');
     }
 }

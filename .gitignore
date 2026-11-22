@@ -3,3 +3,9 @@ obj
 bin
 node_modules
 *.vsix
+
+# Rider plugin (Gradle) build outputs
+IDE/Rider/.gradle/
+IDE/Rider/build/
+IDE/Rider/.idea/
+IDE/Rider/.intellijPlatform/

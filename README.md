@@ -39,6 +39,12 @@ Install the `donkeh.csx-vscode` extension. On first open of a `.cx` file you'll 
 
 Open the settings panel via `CSX: Open Settings` to configure.
 
+## Editor extension builds and installation
+
+CI builds both the VS Code VSIX and the Rider plugin in one workflow
+(`.github/workflows/build-ide-plugins.yml`). See [`IDE/README.md`](IDE/README.md) for
+download links, installation steps, server configuration and local build instructions.
+
 ## csx.json
 
 The language server auto-creates a `csx.json` in the project root if missing. This file configures the transformer:

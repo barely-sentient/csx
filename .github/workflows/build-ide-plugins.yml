@@ -1,0 +1,82 @@
+name: Build IDE plugins (VSIX + Rider)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ide-plugins-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  vsix:
+    name: VS Code extension (VSIX)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: IDE/VsCode/package-lock.json
+
+      - name: Install dependencies
+        working-directory: IDE/VsCode
+        run: npm ci
+
+      - name: Compile
+        working-directory: IDE/VsCode
+        run: npm run compile
+
+      - name: Package VSIX
+        working-directory: IDE/VsCode
+        run: npx vsce package --allow-missing-repository --allow-star-activation --out csx-vscode.vsix
+
+      - name: Upload VSIX
+        uses: actions/upload-artifact@v4
+        with:
+          name: csx-vscode-vsix
+          path: IDE/VsCode/csx-vscode.vsix
+          if-no-files-found: error
+
+  rider:
+    name: Rider plugin (ZIP)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build Rider plugin
+        working-directory: IDE/Rider
+        run: sh ./gradlew buildPlugin --no-daemon
+
+      - name: Upload Rider plugin
+        uses: actions/upload-artifact@v4
+        with:
+          name: csx-rider-plugin
+          path: IDE/Rider/build/distributions/csx-rider-*.zip
+          if-no-files-found: error

@@ -15,35 +15,44 @@ namespace CSX.LanguageServer
             if (map != null) _maps[generatedPath] = map;
         }
 
-        public (int OriginalStart, int OriginalLength)? ToOriginal(string generatedPath, int generatedStart, int generatedLength)
+        public SourceMapEntry? FindGeneratedMapping(string generatedPath, int generatedOffset)
         {
             if (!_maps.TryGetValue(generatedPath, out var map)) return null;
-            // Check sub-entries first (more precise).
+            // Mappings are added from the inside out (sub-mappings first, then the
+            // containing element), so the first match is the most specific one.
             foreach (var m in map.Mappings)
             {
-                if (generatedStart >= m.GeneratedStart && generatedStart < m.GeneratedStart + m.GeneratedLength)
+                if (generatedOffset >= m.GeneratedStart &&
+                    generatedOffset < m.GeneratedStart + m.GeneratedLength)
                 {
-                    // For transformed entries (different lengths), don't interpolate;
-                    // land on the original start (the '<' of the tag) for stability.
-                    if (m.GeneratedLength != m.OriginalLength)
-                    {
-                        int subOffset = generatedStart - m.GeneratedStart;
-                        if (subOffset == 0)
-                        {
-                            return (m.OriginalStart, Math.Min(generatedLength, m.OriginalLength));
-                        }
-                        // For non-zero offset in a transformed entry, try proportional
-                        // but clamp to the original range.
-                        int mapped = m.OriginalStart + (int)Math.Round((double)subOffset / m.GeneratedLength * m.OriginalLength);
-                        mapped = Math.Clamp(mapped, m.OriginalStart, m.OriginalStart + m.OriginalLength - 1);
-                        return (mapped, Math.Min(generatedLength, m.OriginalLength - (mapped - m.OriginalStart)));
-                    }
-                    // Preserved entry: identity mapping (exact).
-                    int off = generatedStart - m.GeneratedStart;
-                    return (m.OriginalStart + off, Math.Min(generatedLength, m.OriginalLength - off));
+                    return m;
                 }
             }
             return null;
+        }
+
+        public (int OriginalStart, int OriginalLength)? ToOriginal(string generatedPath, int generatedStart, int generatedLength)
+        {
+            var m = FindGeneratedMapping(generatedPath, generatedStart);
+            if (m == null) return null;
+
+            // For transformed entries (different lengths), don't interpolate when the
+            // diagnostic starts at the generated marker - land on the original '<'.
+            if (m.GeneratedLength != m.OriginalLength || m.OriginalLength == 1)
+            {
+                int subOffset = generatedStart - m.GeneratedStart;
+                if (subOffset == 0 || m.OriginalLength <= 1)
+                {
+                    return (m.OriginalStart, Math.Min(Math.Max(generatedLength, 1), m.OriginalLength));
+                }
+                int mapped = m.OriginalStart + (int)Math.Round((double)subOffset / m.GeneratedLength * (m.OriginalLength - 1));
+                mapped = Math.Clamp(mapped, m.OriginalStart, m.OriginalStart + m.OriginalLength - 1);
+                return (mapped, Math.Min(Math.Max(generatedLength, 1), m.OriginalStart + m.OriginalLength - mapped));
+            }
+
+            // Preserved entry: identity mapping (exact).
+            int off = generatedStart - m.GeneratedStart;
+            return (m.OriginalStart + off, Math.Min(Math.Max(generatedLength, 1), m.OriginalLength - off));
         }
 
         public int ToGenerated(string generatedPath, int originalOffset)

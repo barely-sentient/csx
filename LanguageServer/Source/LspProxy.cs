@@ -13,10 +13,10 @@ namespace CSX.LanguageServer
 
         private readonly Dictionary<string, string> _originalToGenerated = new(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, string> _generatedToOriginal = new(StringComparer.OrdinalIgnoreCase);
-    private readonly System.Collections.Concurrent.ConcurrentDictionary<int, byte> _injectedIds = new();
-    private int _nextInjectedId = 1000000;
-    private System.Threading.Tasks.TaskCompletionSource<bool>? _projectReady;
-    private readonly Dictionary<int, string> _requestUris = new();
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<int, byte> _injectedIds = new();
+        private System.Threading.Tasks.TaskCompletionSource<bool>? _projectReady;
+        private readonly Dictionary<int, string> _requestUris = new();
+        private string? _currentMethod;
 
         public LspProxy(LanguageServerOptions options, SourceMapResolver resolver)
         {
@@ -183,6 +183,25 @@ namespace CSX.LanguageServer
                     var rewritten = RewriteMessage(doc, clientToServer);
                     await WriteMessageAsync(output, rewritten, ct).ConfigureAwait(false);
 
+                    // didSave regenerates the file on disk; push that text to the C# backend
+                    // as a full didChange so diagnostics refresh without another edit.
+                    if (clientToServer && _currentMethod == "textDocument/didSave" &&
+                        rewritten.RootElement.TryGetProperty("params", out var saveParams) &&
+                        saveParams.TryGetProperty("textDocument", out var saveDoc) &&
+                        saveDoc.TryGetProperty("uri", out var saveUriNode))
+                    {
+                        var genUri = saveUriNode.GetString();
+                        var genPath = UriToPath(genUri ?? "");
+                        if (File.Exists(genPath))
+                        {
+                            var changeJson = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":" +
+                                             JsonSerializer.Serialize(genUri) + "},\"contentChanges\":[{\"text\":" +
+                                             JsonSerializer.Serialize(File.ReadAllText(genPath)) + "}]}}";
+                            using var change = JsonDocument.Parse(changeJson);
+                            await WriteMessageAsync(output, change, ct).ConfigureAwait(false);
+                        }
+                    }
+
                     // After the client signals initialized, open the generated project
                     // in the C# backend so it provides full IntelliSense.
                     if (clientToServer && rewritten.RootElement.TryGetProperty("method", out var m) &&
@@ -272,6 +291,13 @@ namespace CSX.LanguageServer
             var node = JsonNode.Parse(doc.RootElement.GetRawText());
             if (node == null) return doc;
 
+            _currentMethod = node is JsonObject methodObj &&
+                             methodObj.TryGetPropertyValue("method", out var methodNode) &&
+                             methodNode is JsonValue methodValue &&
+                             methodValue.TryGetValue<string>(out var methodName)
+                ? methodName
+                : null;
+
             // Force full-document sync so the proxy can transform whole documents
             // instead of having to replay incremental edits.
             if (!clientToServer)
@@ -320,6 +346,13 @@ namespace CSX.LanguageServer
         {
             if (node is JsonObject obj)
             {
+                // Rider serializes DiagnosticTag as a number; Roslyn's LSP model expects a
+                // string enum. Tags are optional, so drop them before either side sees them.
+                if (obj.ContainsKey("tags") && obj.ContainsKey("message") && obj.ContainsKey("range"))
+                {
+                    obj.Remove("tags");
+                }
+
                 string? uri = currentUri;
                 string? originalUriForTracking = null;
                 if (obj.TryGetPropertyValue("uri", out var uriNode) && uriNode is JsonValue uv && uv.TryGetValue<string>(out var us))
@@ -368,46 +401,26 @@ namespace CSX.LanguageServer
                     if (reqUri != null) _requestUris[ridInt] = reqUri;
                 }
 
-                // didOpen: replace text with generated content
+                // didOpen: always regenerate from the current source and nearest csx.json
                 if (clientToServer && obj.TryGetPropertyValue("text", out var textNode) && textNode is JsonValue tv && tv.TryGetValue<string>(out var originalText))
                 {
-                    // only if parent has uri (textDocument)
                     if (uri != null && uri.EndsWith(".generated.cs", StringComparison.OrdinalIgnoreCase))
                     {
                         var genPath = UriToPath(uri);
-                        if (File.Exists(genPath))
-                        {
-                            obj["text"] = File.ReadAllText(genPath);
-                        }
-                        else
-                        {
-                            // transform on the fly
-                            var origPath = GetOriginalPath(uri);
-                            if (origPath != null && File.Exists(origPath))
-                            {
-                                var source = File.ReadAllText(origPath);
-                                var (text, _) = _transformer.TransformWithSourceMap(source, _options.TransformConfig);
-                                Directory.CreateDirectory(Path.GetDirectoryName(genPath)!);
-                                File.WriteAllText(genPath, text);
-                                obj["text"] = text;
-                            }
-                            else
-                            {
-                                // transform the provided text directly
-                                var (t, _) = _transformer.TransformWithSourceMap(originalText, _options.TransformConfig);
-                                obj["text"] = t;
-                            }
-                        }
+                        var origPath = GetOriginalPath(uri);
+                        var source = File.Exists(origPath) ? File.ReadAllText(origPath) : originalText;
+                        WriteGenerated(genPath, origPath, source);
+                        obj["text"] = File.ReadAllText(genPath);
                     }
                     else if (uri != null && uri.EndsWith(_options.FileExtension, StringComparison.OrdinalIgnoreCase))
                     {
-                        // fallback: transform provided text
-                        var (t, _) = _transformer.TransformWithSourceMap(originalText);
-                        obj["text"] = t;
+                        var genPath = GetGeneratedPath(UriToPath(uri));
+                        WriteGenerated(genPath, UriToPath(uri), originalText);
+                        obj["text"] = File.ReadAllText(genPath);
                     }
                 }
 
-                // didChange (full sync): transform each content change's text
+                // didChange (full sync): regenerate from the edited .cx text
                 if (clientToServer && obj.TryGetPropertyValue("contentChanges", out var ccNode) && ccNode is JsonArray ccArr)
                 {
                     foreach (var item in ccArr)
@@ -416,37 +429,32 @@ namespace CSX.LanguageServer
                         if (co.ContainsKey("range")) continue; // incremental; skip
                         if (co.TryGetPropertyValue("text", out var tNode) && tNode is JsonValue tv2 && tv2.TryGetValue<string>(out var ct))
                         {
-                            string? genText = null;
-                            SourceMap? genMap = null;
-                            if (uri != null && (uri.EndsWith(".generated.cs", StringComparison.OrdinalIgnoreCase) || uri.EndsWith(_options.FileExtension, StringComparison.OrdinalIgnoreCase)))
+                            if (uri != null && uri.EndsWith(".generated.cs", StringComparison.OrdinalIgnoreCase))
                             {
-                                var (t, m) = _transformer.TransformWithSourceMap(ct, _options.TransformConfig);
-                                genText = t;
-                                genMap = m;
+                                var genPath = UriToPath(uri);
+                                WriteGenerated(genPath, GetOriginalPath(uri), ct);
+                                co["text"] = File.ReadAllText(genPath);
                             }
-                            if (genText != null)
+                            else if (uri != null && uri.EndsWith(_options.FileExtension, StringComparison.OrdinalIgnoreCase))
                             {
-                                co["text"] = genText;
-                                // persist updated generated file + map for position mapping
-                                if (uri != null && uri.EndsWith(".generated.cs", StringComparison.OrdinalIgnoreCase))
-                                {
-                                    try
-                                    {
-                                        var genPath = UriToPath(uri);
-                                        Directory.CreateDirectory(Path.GetDirectoryName(genPath)!);
-                                        File.WriteAllText(genPath, genText);
-                                        if (genMap != null)
-                                        {
-                                            genMap.SourceFile = GetOriginalPath(uri);
-                                            genMap.GeneratedFile = genPath;
-                                            File.WriteAllText(genPath + ".map", System.Text.Json.JsonSerializer.Serialize(genMap));
-                                        }
-                                        _resolver.Load(genPath);
-                                    }
-                                    catch { }
-                                }
+                                var origPath = UriToPath(uri);
+                                var genPath = GetGeneratedPath(origPath);
+                                WriteGenerated(genPath, origPath, ct);
+                                co["text"] = File.ReadAllText(genPath);
                             }
                         }
+                    }
+                }
+
+                // didSave: the editor may not send didChange again, so regenerate from disk.
+                if (clientToServer && _currentMethod == "textDocument/didSave" && uri != null &&
+                    uri.EndsWith(".generated.cs", StringComparison.OrdinalIgnoreCase))
+                {
+                    var genPath = UriToPath(uri);
+                    var origPath = GetOriginalPath(uri);
+                    if (File.Exists(origPath))
+                    {
+                        WriteGenerated(genPath, origPath, File.ReadAllText(origPath));
                     }
                 }
 
@@ -461,8 +469,18 @@ namespace CSX.LanguageServer
                 if (obj.ContainsKey("start") && obj.ContainsKey("end") &&
                     obj["start"] is JsonObject && obj["end"] is JsonObject)
                 {
-                    ConvertPosition((JsonObject)obj["start"]!, clientToServer, uri ?? currentUri);
-                    ConvertPosition((JsonObject)obj["end"]!, clientToServer, uri ?? currentUri);
+                    if (!clientToServer)
+                    {
+                        // Map start and end as one unit. Mapping the end independently can
+                        // land in a different source-map entry (or none at all), producing
+                        // diagnostics that stretch across unrelated source lines.
+                        ConvertRange((JsonObject)obj["start"]!, (JsonObject)obj["end"]!, uri ?? currentUri);
+                    }
+                    else
+                    {
+                        ConvertPosition((JsonObject)obj["start"]!, clientToServer, uri ?? currentUri, false);
+                        ConvertPosition((JsonObject)obj["end"]!, clientToServer, uri ?? currentUri, true);
+                    }
                 }
 
                 foreach (var kv in obj.ToList())
@@ -480,7 +498,7 @@ namespace CSX.LanguageServer
         }
 
         // Helpers for URI mapping
-        private void ConvertPosition(JsonObject pos, bool clientToServer, string? uri)
+        private void ConvertPosition(JsonObject pos, bool clientToServer, string? uri, bool isRangeEnd = false)
         {
             if (uri == null) return;
             if (!int.TryParse(pos["line"]?.ToString(), out var line)) return;
@@ -502,8 +520,8 @@ namespace CSX.LanguageServer
 
             _resolver.Load(generatedPath);
 
-            string originalText = File.Exists(originalPath) ? File.ReadAllText(originalPath) : "";
-            string generatedText = File.Exists(generatedPath) ? File.ReadAllText(generatedPath) : "";
+            string originalText = NormalizeLineEndings(File.Exists(originalPath) ? File.ReadAllText(originalPath) : "");
+            string generatedText = NormalizeLineEndings(File.Exists(generatedPath) ? File.ReadAllText(generatedPath) : "");
 
             int offset = clientToServer
                 ? PositionToOffset(originalText, line, ch)
@@ -513,11 +531,31 @@ namespace CSX.LanguageServer
             if (clientToServer)
             {
                 mappedOffset = _resolver.ToGenerated(generatedPath, offset);
+
+                // Source maps only track whole JSX nodes, so an identifier inside a tag
+                // can land at the start of the generated React.CreateElement call. Roslyn
+                // then sees whitespace and returns no completions/hover. Snap the caret
+                // onto the same identifier text in the generated document.
+                if (_currentMethod is "textDocument/completion" or "textDocument/hover" or
+                    "textDocument/definition" or "textDocument/references" or
+                    "textDocument/rename" or "textDocument/signatureHelp")
+                {
+                    var word = GetWordAtOffset(originalText, offset);
+                    if (word.Length > 0)
+                    {
+                        var snapped = FindClosestOccurrence(generatedText, word, mappedOffset);
+                        if (snapped >= 0) mappedOffset = snapped + word.Length;
+                    }
+                }
             }
             else
             {
                 var r = _resolver.ToOriginal(generatedPath, offset, 1);
                 mappedOffset = r?.OriginalStart ?? offset;
+                if (isRangeEnd && r != null && r.Value.OriginalLength > 1)
+                {
+                    mappedOffset = Math.Min(originalText.Length, r.Value.OriginalStart + r.Value.OriginalLength);
+                }
             }
 
             var (newLine, newChar) = clientToServer
@@ -527,6 +565,118 @@ namespace CSX.LanguageServer
             pos["line"] = newLine;
             pos["character"] = newChar;
         }
+
+        private void ConvertRange(JsonObject start, JsonObject end, string? uri)
+        {
+            if (uri == null) return;
+            if (!int.TryParse(start["line"]?.ToString(), out var startLine) ||
+                !int.TryParse(start["character"]?.ToString(), out var startChar) ||
+                !int.TryParse(end["line"]?.ToString(), out var endLine) ||
+                !int.TryParse(end["character"]?.ToString(), out var endChar))
+            {
+                return;
+            }
+
+            var originalPath = UriToPath(uri);
+            var generatedPath = GetGeneratedPath(originalPath);
+            _resolver.Load(generatedPath);
+
+            string originalText = NormalizeLineEndings(File.Exists(originalPath) ? File.ReadAllText(originalPath) : "");
+            string generatedText = NormalizeLineEndings(File.Exists(generatedPath) ? File.ReadAllText(generatedPath) : "");
+
+            int generatedStart = PositionToOffset(generatedText, startLine, startChar);
+            int generatedEnd = Math.Max(generatedStart + 1, PositionToOffset(generatedText, endLine, endChar));
+
+            var mapping = _resolver.FindGeneratedMapping(generatedPath, generatedStart);
+            int originalStart;
+            int originalEnd;
+
+            if (mapping == null)
+            {
+                originalStart = Math.Clamp(generatedStart, 0, originalText.Length);
+                originalEnd = Math.Clamp(generatedEnd, 0, originalText.Length);
+            }
+            else if (mapping.OriginalLength <= 1 || mapping.GeneratedLength <= 0)
+            {
+                // Every generated fragment for a JSX node is anchored to the original '<'.
+                originalStart = Math.Clamp(mapping.OriginalStart, 0, originalText.Length);
+                originalEnd = Math.Min(originalText.Length, originalStart + 1);
+            }
+            else
+            {
+                originalStart = Math.Clamp(mapping.OriginalStart, 0, originalText.Length);
+                int generatedSpan = Math.Min(
+                    Math.Max(1, generatedEnd - generatedStart),
+                    Math.Max(1, mapping.GeneratedStart + mapping.GeneratedLength - generatedStart));
+                int originalSpan = Math.Clamp(
+                    (int)Math.Round((double)generatedSpan / mapping.GeneratedLength * mapping.OriginalLength),
+                    1,
+                    mapping.OriginalLength);
+                originalEnd = Math.Min(originalText.Length, originalStart + originalSpan);
+
+                // Preserved text can use the exact end mapping when one exists.
+                if (mapping.GeneratedLength == mapping.OriginalLength)
+                {
+                    var endMapping = _resolver.FindGeneratedMapping(generatedPath, generatedEnd);
+                    if (endMapping != null &&
+                        endMapping.GeneratedLength == endMapping.OriginalLength &&
+                        endMapping.OriginalStart >= originalStart)
+                    {
+                        int offsetInEntry = Math.Clamp(generatedEnd - endMapping.GeneratedStart, 0, endMapping.OriginalLength);
+                        var candidate = Math.Min(originalText.Length, endMapping.OriginalStart + Math.Max(1, offsetInEntry));
+                        if (candidate > originalStart) originalEnd = candidate;
+                    }
+                }
+            }
+
+            if (originalEnd <= originalStart)
+            {
+                originalEnd = Math.Min(originalText.Length, originalStart + 1);
+            }
+
+            var (mappedStartLine, mappedStartChar) = OffsetToPosition(originalText, originalStart);
+            var (mappedEndLine, mappedEndChar) = OffsetToPosition(originalText, originalEnd);
+
+            start["line"] = mappedStartLine;
+            start["character"] = mappedStartChar;
+            end["line"] = mappedEndLine;
+            end["character"] = mappedEndChar;
+        }
+
+        private static string GetWordAtOffset(string text, int offset)
+        {
+            if (offset < 0 || offset > text.Length) return string.Empty;
+            int start = offset;
+            while (start > 0 && (char.IsLetterOrDigit(text[start - 1]) || text[start - 1] == '_')) start--;
+            int end = offset;
+            while (end < text.Length && (char.IsLetterOrDigit(text[end]) || text[end] == '_')) end++;
+            return text.Substring(start, end - start);
+        }
+
+        private static int FindClosestOccurrence(string text, string needle, int nearOffset)
+        {
+            if (needle.Length == 0 || text.Length < needle.Length) return -1;
+
+            int best = -1;
+            int bestDistance = int.MaxValue;
+            int index = 0;
+            while ((index = text.IndexOf(needle, index, StringComparison.OrdinalIgnoreCase)) >= 0)
+            {
+                int distance = Math.Abs(index - nearOffset);
+                if (distance < bestDistance)
+                {
+                    bestDistance = distance;
+                    best = index;
+                }
+                index += needle.Length;
+            }
+
+            // Avoid snapping to an unrelated identifier far away.
+            return bestDistance <= 4000 ? best : -1;
+        }
+
+        private static string NormalizeLineEndings(string text) =>
+            text.Replace("\r\n", "\n").Replace('\r', '\n');
 
         private static int PositionToOffset(string text, int line, int character)
         {
@@ -586,6 +736,25 @@ namespace CSX.LanguageServer
             return generatedUri;
         }
 
+        private void WriteGenerated(string generatedPath, string originalPath, string source)
+        {
+            try
+            {
+                var config = LanguageServer.LoadConfigForFile(originalPath, _options.TransformConfig, _options.ProjectRoot);
+                var (text, map) = _transformer.TransformWithSourceMap(source, config);
+                Directory.CreateDirectory(Path.GetDirectoryName(generatedPath)!);
+                File.WriteAllText(generatedPath, text);
+                map.SourceFile = originalPath;
+                map.GeneratedFile = generatedPath;
+                File.WriteAllText(generatedPath + ".map", System.Text.Json.JsonSerializer.Serialize(map));
+                _resolver.Load(generatedPath);
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine("csx: failed to write generated file: " + ex.Message);
+            }
+        }
+
         private string GetGeneratedPath(string originalPath)
         {
             var root = _options.ProjectRoot;
@@ -598,6 +767,23 @@ namespace CSX.LanguageServer
         {
             var path = UriToPath(generatedUri);
             if (_generatedToOriginal.TryGetValue(path, out var orig)) return orig;
+
+            // The URI dictionaries are not always populated before didOpen (for example after
+            // a server restart). Derive the source path structurally so we never re-transform
+            // the generated file as if it were .cx source.
+            if (path.EndsWith(".generated.cs", StringComparison.OrdinalIgnoreCase))
+            {
+                var outputDir = Path.Combine(_options.ProjectRoot, _options.OutputDirectory);
+                var rel = Path.GetRelativePath(outputDir, path);
+                if (rel.EndsWith(".generated.cs", StringComparison.OrdinalIgnoreCase))
+                {
+                    rel = rel.Substring(0, rel.Length - ".generated.cs".Length);
+                    var original = Path.Combine(_options.ProjectRoot, rel);
+                    _generatedToOriginal[path] = original;
+                    _originalToGenerated[original] = path;
+                    return original;
+                }
+            }
             return path;
         }
 

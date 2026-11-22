@@ -86,8 +86,7 @@ public class UserDashboard
         var message = $"Found {users.Count} active users";
 
         // JSX STARTS HERE
-
-        return
+        return 
         <div className="dashboard">
             <header>
                 <h1>{message}</h1>

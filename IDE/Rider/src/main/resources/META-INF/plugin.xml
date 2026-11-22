@@ -1,0 +1,67 @@
+<idea-plugin>
+    <id>com.donkeh.csx.rider</id>
+    <name>CSX Language Support</name>
+    <vendor email="" url="https://github.com/donkeh/csx">donkeh</vendor>
+
+    <description><![CDATA[
+        Provides language support for CSharpExtended (.cx) files in Rider.
+
+        Registers the .cx file type with syntax highlighting and connects to the
+        existing <code>csx lang-server</code> LSP server for diagnostics, completion,
+        navigation, and other language features.
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+    <depends>com.intellij.modules.lang</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <!-- The language must be registered by id before the file type, syntax
+             highlighter and LSP editor providers can be resolved for .cx files. -->
+        <language id="CSX" name="CSX" implementationClass="com.donkeh.csx.rider.CxLanguage"/>
+
+        <lang.parserDefinition
+                language="CSX"
+                implementationClass="com.donkeh.csx.rider.CxParserDefinition"/>
+
+        <fileType
+                name="CSX"
+                implementationClass="com.donkeh.csx.rider.CxFileType"
+                fieldName="INSTANCE"
+                language="CSX"
+                extensions="cx"/>
+
+        <lang.syntaxHighlighterFactory
+                language="CSX"
+                implementationClass="com.donkeh.csx.rider.CxSyntaxHighlighter$Factory"/>
+
+        <completion.contributor
+                language="CSX"
+                implementationClass="com.donkeh.csx.rider.CxCompletionContributor"/>
+
+        <projectConfigurable
+                parentId="language"
+                instance="com.donkeh.csx.rider.CxConfigurable"
+                id="csx.configurable"
+                displayName="CSX"
+                nonDefaultProject="true"/>
+    </extensions>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <platform.lsp.serverSupportProvider implementation="com.donkeh.csx.rider.CxLspServerSupportProvider"/>
+    </extensions>
+
+    <actions>
+        <action id="CSX.StartServer"
+                class="com.donkeh.csx.rider.CxStartServerAction"
+                text="Start CSX Language Server"
+                description="Start the CSX language server for this project">
+            <add-to-group group-id="ToolsMenu" anchor="last"/>
+        </action>
+        <action id="CSX.RestartServer"
+                class="com.donkeh.csx.rider.CxRestartServerAction"
+                text="Restart CSX Language Server"
+                description="Restart the CSX language server for this project">
+            <add-to-group group-id="ToolsMenu" anchor="last"/>
+        </action>
+    </actions>
+</idea-plugin>

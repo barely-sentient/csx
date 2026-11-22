@@ -158,7 +158,7 @@ namespace CSX.LanguageServer
                 sb.AppendLine("  <ItemGroup>");
                 sb.AppendLine("    <Compile Include=\"**/*.generated.cs\" />");
                 // Include real .cs files from the project root, excluding bin/obj and the output dir.
-                sb.AppendLine("    <Compile Include=\"../../**/*.cs\" Exclude=\"../../bin/**;../../obj/**;../../**/bin/**;../../**/obj/**\" />");
+                sb.AppendLine("    <Compile Include=\"../../**/*.cs\" Exclude=\"../../bin/**;../../obj/**;../../**/bin/**;../../**/obj/**;../../**/Debug/**;../../**/Release/**\" />");
                 sb.AppendLine("  </ItemGroup>");
 
                 if (packageRefs.Count > 0 || frameworkRefs.Count > 0)
@@ -271,15 +271,37 @@ namespace CSX.LanguageServer
             var outputDir = Path.Combine(root, _options.OutputDirectory);
             Directory.CreateDirectory(outputDir);
 
+            // Remove generated output from previous runs so files that are no longer source
+            // (for example stale debug fixtures) cannot leak into the synthetic project.
+            try
+            {
+                foreach (var stale in Directory.EnumerateFiles(outputDir, "*", SearchOption.AllDirectories))
+                {
+                    if (stale.EndsWith(".generated.cs", StringComparison.OrdinalIgnoreCase) ||
+                        stale.EndsWith(".generated.cs.map", StringComparison.OrdinalIgnoreCase))
+                    {
+                        File.Delete(stale);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"csx: failed to clear generated output: {ex.Message}");
+            }
+
             foreach (var file in Directory.EnumerateFiles(root, "*" + _options.FileExtension, SearchOption.AllDirectories))
             {
                 if (ct.IsCancellationRequested) break;
+
+                var relative = Path.GetRelativePath(root, file);
+                if (IsIgnoredSourcePath(relative)) continue;
+
                 try
                 {
                     var source = await File.ReadAllTextAsync(file, ct).ConfigureAwait(false);
                     var transformer = new CSX.Transformer.Transformer();
-                    var (text, map) = transformer.TransformWithSourceMap(source, _options.TransformConfig);
-                    var relative = Path.GetRelativePath(root, file);
+                    var config = LoadConfigForFile(file, _options.TransformConfig, root);
+                    var (text, map) = transformer.TransformWithSourceMap(source, config);
                     var outPath = Path.Combine(outputDir, relative + ".generated.cs");
                     Directory.CreateDirectory(Path.GetDirectoryName(outPath)!);
                     await File.WriteAllTextAsync(outPath, text, ct).ConfigureAwait(false);
@@ -298,6 +320,48 @@ namespace CSX.LanguageServer
                     Console.Error.WriteLine($"csx: failed to transform '{file}': {ex.Message}");
                 }
             }
+        }
+
+        internal static TransformConfig LoadConfigForFile(string file, TransformConfig? fallback, string root)
+        {
+            try
+            {
+                var dir = new FileInfo(file).Directory;
+                var rootDir = new DirectoryInfo(root);
+                while (dir != null)
+                {
+                    var configPath = Path.Combine(dir.FullName, "csx.json");
+                    if (File.Exists(configPath))
+                    {
+                        var json = File.ReadAllText(configPath);
+                        var loaded = JsonSerializer.Deserialize<TransformConfig>(json);
+                        if (loaded != null) return loaded;
+                    }
+                    if (string.Equals(dir.FullName, rootDir.FullName, StringComparison.OrdinalIgnoreCase)) break;
+                    dir = dir.Parent;
+                }
+            }
+            catch { }
+            return fallback ?? new TransformConfig();
+        }
+
+        private static bool IsIgnoredSourcePath(string relativePath)
+        {
+            var separators = new[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar };
+            foreach (var part in relativePath.Split(separators, StringSplitOptions.RemoveEmptyEntries))
+            {
+                // Build outputs and debug harness fixtures contain copies of the sample .cx
+                // files. Compiling them alongside the real sources causes duplicate type and
+                // member diagnostics.
+                if (part.Equals("bin", StringComparison.OrdinalIgnoreCase) ||
+                    part.Equals("obj", StringComparison.OrdinalIgnoreCase) ||
+                    part.Equals("Debug", StringComparison.OrdinalIgnoreCase) ||
+                    part.Equals("Release", StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+            return false;
         }
 
         private async Task RunMinimalServerAsync(CancellationToken ct)
