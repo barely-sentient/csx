@@ -16,8 +16,8 @@ namespace CSX.LanguageServer
         private readonly System.Collections.Concurrent.ConcurrentDictionary<int, byte> _injectedIds = new();
         private System.Threading.Tasks.TaskCompletionSource<bool>? _projectReady;
         private readonly Dictionary<int, string> _requestUris = new();
-        private string? _currentMethod;
         private readonly object _rewriteLock = new();
+        private readonly object _pendingReadLock = new();
 
         // Latest editor buffer for each open source file (LF-normalized). Positions from the
         // client refer to the buffer, which differs from the file on disk while it has unsaved edits.
@@ -46,7 +46,7 @@ namespace CSX.LanguageServer
                 Console.Error.WriteLine("handshake: got init");
                 if (initDoc != null)
                 {
-                    var rewrittenInit = RewriteMessage(initDoc, true);
+                    var rewrittenInit = RewriteMessage(initDoc, true, out _);
                     await WriteMessageAsync(backendIn, rewrittenInit, ct).ConfigureAwait(false);
 
                     // Wait for initialize response.
@@ -56,9 +56,6 @@ namespace CSX.LanguageServer
                     var deadline = DateTime.UtcNow.AddSeconds(10);
                     while (initResp == null && DateTime.UtcNow < deadline && !ct.IsCancellationRequested)
                     {
-                        // Wait for the whole remaining window; the old 3s per-read timeout gave up
-                        // on a backend that was merely slow to start, so the client never got its
-                        // initialize response.
                         var (timedOut, msg) = await ReadBackendAsync(backendOut, deadline - DateTime.UtcNow, ct).ConfigureAwait(false);
                         if (timedOut || msg == null) break;
                         if (initIdRaw != null && msg.RootElement.TryGetProperty("id", out var rid) &&
@@ -89,7 +86,6 @@ namespace CSX.LanguageServer
                                 }
                                 if (resp != null) await WriteMessageAsync(backendIn, resp, ct).ConfigureAwait(false);
                             }
-                            // discard logs/notifications during handshake
                         }
                     }
 
@@ -112,7 +108,6 @@ namespace CSX.LanguageServer
                                 _projectReady?.TrySetResult(true);
                                 break;
                             }
-                            // Respond to server->client requests; discard the rest.
                             if (msg.RootElement.TryGetProperty("method", out var m2) && msg.RootElement.TryGetProperty("id", out var rid2))
                             {
                                 var method = m2.GetString();
@@ -136,7 +131,7 @@ namespace CSX.LanguageServer
                     Console.Error.WriteLine("handshake: sending init response to client");
                     if (initResp != null)
                     {
-                        var rewrittenResp = RewriteMessage(initResp, false);
+                        var rewrittenResp = RewriteMessage(initResp, false, out _);
                         await WriteMessageAsync(clientOut, rewrittenResp, ct).ConfigureAwait(false);
                         Console.Error.WriteLine("handshake: init response sent");
                     }
@@ -163,12 +158,23 @@ namespace CSX.LanguageServer
         private async Task<(bool TimedOut, JsonDocument? Doc)> ReadBackendAsync(Stream backendOut, TimeSpan timeout, CancellationToken ct)
         {
             if (timeout < TimeSpan.Zero) timeout = TimeSpan.Zero;
-            _pendingBackendRead ??= ReadMessageAsync(backendOut, ct);
-            var pending = _pendingBackendRead;
+            Task<JsonDocument?> pending;
+            lock (_pendingReadLock)
+            {
+                _pendingBackendRead ??= ReadMessageAsync(backendOut, ct);
+                pending = _pendingBackendRead;
+            }
+
             var completed = await Task.WhenAny(pending, Task.Delay(timeout, ct)).ConfigureAwait(false);
             if (completed != pending) return (true, null);
 
-            _pendingBackendRead = null;
+            lock (_pendingReadLock)
+            {
+                if (_pendingBackendRead == pending)
+                {
+                    _pendingBackendRead = null;
+                }
+            }
             return (false, await pending.ConfigureAwait(false));
         }
 
@@ -177,16 +183,23 @@ namespace CSX.LanguageServer
             while (!ct.IsCancellationRequested)
             {
                 JsonDocument? doc;
-                var pendingRead = !clientToServer ? _pendingBackendRead : null;
-                if (pendingRead != null)
+                if (!clientToServer)
                 {
-                    _pendingBackendRead = null;
-                    doc = await pendingRead.ConfigureAwait(false);
+                    Task<JsonDocument?>? pendingRead;
+                    lock (_pendingReadLock)
+                    {
+                        pendingRead = _pendingBackendRead;
+                        _pendingBackendRead = null;
+                    }
+                    doc = pendingRead != null
+                        ? await pendingRead.ConfigureAwait(false)
+                        : await ReadMessageAsync(input, ct).ConfigureAwait(false);
                 }
                 else
                 {
                     doc = await ReadMessageAsync(input, ct).ConfigureAwait(false);
                 }
+
                 if (doc == null) break;
 
                 // Drop responses to injected warm-up requests so they don't reach the client.
@@ -233,8 +246,7 @@ namespace CSX.LanguageServer
 
                     // After the client signals initialized, open the generated project
                     // in the C# backend so it provides full IntelliSense.
-                    if (clientToServer && rewritten.RootElement.TryGetProperty("method", out var m) &&
-                        m.GetString() == "initialized" &&
+                    if (clientToServer && handledMethod == "initialized" &&
                         !string.IsNullOrWhiteSpace(_options.GeneratedProjectPath) &&
                         File.Exists(_options.GeneratedProjectPath))
                     {
@@ -243,8 +255,6 @@ namespace CSX.LanguageServer
                             "{\"jsonrpc\":\"2.0\",\"method\":\"project/open\",\"params\":{\"projects\":[\"" + projectUri + "\"]}}");
                         await WriteMessageAsync(output, openProject, ct).ConfigureAwait(false);
                     }
-
-                    // (warm-up hover removed: project is loaded before didOpen now)
                 }
                 catch (Exception ex)
                 {
@@ -315,32 +325,28 @@ namespace CSX.LanguageServer
             await stream.FlushAsync(ct).ConfigureAwait(false);
         }
 
-        private JsonDocument RewriteMessage(JsonDocument doc, bool clientToServer) =>
-            RewriteMessage(doc, clientToServer, out _);
-
-        // Both pump directions rewrite messages concurrently, and rewriting touches shared state
-        // (_currentMethod, _requestUris, the path maps). Serialize it, and hand the method back to
-        // the caller instead of having it read a field another thread may have overwritten.
-        private JsonDocument RewriteMessage(JsonDocument doc, bool clientToServer, out string? method)
+        private JsonDocument RewriteMessage(JsonDocument doc, bool clientToServer, out string? methodName)
         {
             lock (_rewriteLock)
             {
-                var result = RewriteMessageCore(doc, clientToServer);
-                method = _currentMethod;
-                return result;
+                return RewriteMessageCore(doc, clientToServer, out methodName);
             }
         }
 
-        private JsonDocument RewriteMessageCore(JsonDocument doc, bool clientToServer)
+        private JsonDocument RewriteMessageCore(JsonDocument doc, bool clientToServer, out string? methodName)
         {
             var node = JsonNode.Parse(doc.RootElement.GetRawText());
-            if (node == null) return doc;
+            if (node == null)
+            {
+                methodName = null;
+                return doc;
+            }
 
-            _currentMethod = node is JsonObject methodObj &&
-                             methodObj.TryGetPropertyValue("method", out var methodNode) &&
-                             methodNode is JsonValue methodValue &&
-                             methodValue.TryGetValue<string>(out var methodName)
-                ? methodName
+            methodName = node is JsonObject methodObj &&
+                         methodObj.TryGetPropertyValue("method", out var methodNode) &&
+                         methodNode is JsonValue methodValue &&
+                         methodValue.TryGetValue<string>(out var parsedMethod)
+                ? parsedMethod
                 : null;
 
             // Force full-document sync so the proxy can transform whole documents
@@ -369,25 +375,18 @@ namespace CSX.LanguageServer
                 catch { }
             }
 
-            // Log hover/completion for debugging
-            try
+            if (methodName == "textDocument/hover" || methodName == "textDocument/completion")
             {
-                var method = node["method"]?.GetValue<string>();
-                if (method == "textDocument/hover" || method == "textDocument/completion")
-                {
-                    Console.Error.WriteLine("proxy: " + (clientToServer ? "C->S" : "S->C") + " " + method);
-                }
+                Console.Error.WriteLine("proxy: " + (clientToServer ? "C->S" : "S->C") + " " + methodName);
             }
-            catch { }
 
-            // Ensure generated files exist for any uri encountered
-            RewriteNode(node, clientToServer, null);
+            RewriteNode(node, clientToServer, null, methodName);
 
             var newJson = node.ToJsonString();
             return JsonDocument.Parse(newJson);
         }
 
-        private void RewriteNode(JsonNode? node, bool clientToServer, string? currentUri)
+        private void RewriteNode(JsonNode? node, bool clientToServer, string? currentUri, string? methodName)
         {
             if (node is JsonObject obj)
             {
@@ -403,27 +402,17 @@ namespace CSX.LanguageServer
                 if (obj.TryGetPropertyValue("uri", out var uriNode) && uriNode is JsonValue uv && uv.TryGetValue<string>(out var us))
                 {
                     originalUriForTracking = us;
-                    if (clientToServer)
-                    {
-                        uri = GetGeneratedUri(us);
-                    }
-                    else
-                    {
-                        uri = GetOriginalUri(us);
-                    }
+                    uri = clientToServer ? GetGeneratedUri(us) : GetOriginalUri(us);
                     obj["uri"] = uri;
                 }
                 else if (obj.TryGetPropertyValue("textDocument", out var tdNode) && tdNode is JsonObject tdObj &&
                          tdObj.TryGetPropertyValue("uri", out var tdu) && tdu is JsonValue tuv && tuv.TryGetValue<string>(out var tus))
                 {
-                    // Resolve uri from nested textDocument even if it appears later in traversal.
-                    if (clientToServer) uri = GetGeneratedUri(tus);
-                    else uri = GetOriginalUri(tus);
+                    uri = clientToServer ? GetGeneratedUri(tus) : GetOriginalUri(tus);
                 }
                 else if (!clientToServer && obj.TryGetPropertyValue("id", out var idNode) && idNode is JsonValue idv &&
                          idv.TryGetValue<int>(out var idInt) && !obj.ContainsKey("method"))
                 {
-                    // Response to a previous client request: resolve uri from tracked request.
                     if (_requestUris.TryGetValue(idInt, out var origUri))
                     {
                         uri = origUri;
@@ -434,19 +423,20 @@ namespace CSX.LanguageServer
                     }
                 }
 
-                // Track request uris for response mapping.
                 if (clientToServer && obj.TryGetPropertyValue("id", out var ridNode) && ridNode is JsonValue ridv &&
                     ridv.TryGetValue<int>(out var ridInt) && obj.TryGetPropertyValue("method", out _))
                 {
-                    // find uri in this request (may be nested under params.textDocument)
                     string? reqUri = originalUriForTracking;
                     if (reqUri == null && obj.TryGetPropertyValue("params", out var rparams) && rparams is JsonObject rpo &&
                         rpo.TryGetPropertyValue("textDocument", out var rtd) && rtd is JsonObject rtdo &&
-                        rtdo.TryGetPropertyValue("uri", out var rtdu) && rtdu is JsonValue rtuv && rtuv.TryGetValue<string>(out var rtus)) reqUri = rtus;
+                        rtdo.TryGetPropertyValue("uri", out var rtdu) && rtdu is JsonValue rtuv && rtuv.TryGetValue<string>(out var rtus))
+                    {
+                        reqUri = rtus;
+                    }
                     if (reqUri != null) _requestUris[ridInt] = reqUri;
                 }
 
-                if (clientToServer && _currentMethod == "textDocument/didClose" && uri != null &&
+                if (clientToServer && methodName == "textDocument/didClose" && uri != null &&
                     uri.EndsWith(".generated.cs", StringComparison.OrdinalIgnoreCase))
                 {
                     _openText.Remove(GetOriginalPath(uri));
@@ -460,8 +450,6 @@ namespace CSX.LanguageServer
                         var genPath = UriToPath(uri);
                         var origPath = GetOriginalPath(uri);
 
-                        // When the client opened the .cx file itself, its text IS the current
-                        // buffer. Only fall back to disk if it opened the generated file directly.
                         bool openedFromSource = originalUriForTracking != null &&
                             originalUriForTracking.EndsWith(_options.FileExtension, StringComparison.OrdinalIgnoreCase);
                         var source = openedFromSource
@@ -485,7 +473,7 @@ namespace CSX.LanguageServer
                     foreach (var item in ccArr)
                     {
                         if (item is not JsonObject co) continue;
-                        if (co.ContainsKey("range")) continue; // incremental; skip
+                        if (co.ContainsKey("range")) continue;
                         if (co.TryGetPropertyValue("text", out var tNode) && tNode is JsonValue tv2 && tv2.TryGetValue<string>(out var ct))
                         {
                             if (uri != null && uri.EndsWith(".generated.cs", StringComparison.OrdinalIgnoreCase))
@@ -509,7 +497,7 @@ namespace CSX.LanguageServer
                 }
 
                 // didSave: the editor may not send didChange again, so regenerate from disk.
-                if (clientToServer && _currentMethod == "textDocument/didSave" && uri != null &&
+                if (clientToServer && methodName == "textDocument/didSave" && uri != null &&
                     uri.EndsWith(".generated.cs", StringComparison.OrdinalIgnoreCase))
                 {
                     var genPath = UriToPath(uri);
@@ -533,9 +521,6 @@ namespace CSX.LanguageServer
                 {
                     if (!clientToServer)
                     {
-                        // Map start and end as one unit. Mapping the end independently can
-                        // land in a different source-map entry (or none at all), producing
-                        // diagnostics that stretch across unrelated source lines.
                         ConvertRange((JsonObject)obj["start"]!, (JsonObject)obj["end"]!, uri ?? currentUri);
                     }
                     else
@@ -547,19 +532,18 @@ namespace CSX.LanguageServer
 
                 foreach (var kv in obj.ToList())
                 {
-                    RewriteNode(kv.Value, clientToServer, uri);
+                    RewriteNode(kv.Value, clientToServer, uri, methodName);
                 }
             }
             else if (node is JsonArray arr)
             {
                 foreach (var item in arr)
                 {
-                    RewriteNode(item, clientToServer, currentUri);
+                    RewriteNode(item, clientToServer, currentUri, methodName);
                 }
             }
         }
 
-        // Helpers for URI mapping
         private void ConvertPosition(JsonObject pos, bool clientToServer, string? uri, bool isRangeEnd = false)
         {
             if (uri == null) return;
@@ -580,9 +564,6 @@ namespace CSX.LanguageServer
                 generatedPath = GetGeneratedPath(originalPath);
             }
 
-            // Only .cx files have a generated counterpart. Positions in plain .cs files (for example
-            // a definition or reference that lands in one) must pass through untouched; mapping
-            // them against a non-existent generated file collapsed them onto line 0.
             if (!originalPath.EndsWith(_options.FileExtension, StringComparison.OrdinalIgnoreCase)) return;
 
             _resolver.Load(generatedPath);
@@ -598,23 +579,6 @@ namespace CSX.LanguageServer
             if (clientToServer)
             {
                 mappedOffset = _resolver.ToGenerated(generatedPath, offset);
-
-                // If the mapped position is not on the same identifier (an unmapped region, or
-                // a rewritten node), snap the caret onto the nearest matching identifier in the
-                // generated document. Skip this when the mapping is already exact: snapping then
-                // jumped to a *closer* occurrence of the same word, e.g. the next "foo" in "foo foo".
-                if (_currentMethod is "textDocument/completion" or "textDocument/hover" or
-                    "textDocument/definition" or "textDocument/references" or
-                    "textDocument/rename" or "textDocument/signatureHelp")
-                {
-                    var word = GetWordAtOffset(originalText, offset);
-                    if (word.Length > 0 &&
-                        !string.Equals(GetWordAtOffset(generatedText, mappedOffset), word, StringComparison.Ordinal))
-                    {
-                        var snapped = FindClosestOccurrence(generatedText, word, mappedOffset);
-                        if (snapped >= 0) mappedOffset = snapped + word.Length;
-                    }
-                }
             }
             else
             {
@@ -668,15 +632,11 @@ namespace CSX.LanguageServer
             else if ((mapping.OriginalLength <= 1 && mapping.GeneratedLength != mapping.OriginalLength) ||
                      mapping.GeneratedLength <= 0)
             {
-                // Every generated fragment for a JSX node is anchored to the original '<'.
                 originalStart = Math.Clamp(mapping.OriginalStart, 0, originalText.Length);
                 originalEnd = Math.Min(originalText.Length, originalStart + 1);
             }
             else
             {
-                // Preserved (1:1) entries map exactly, so honour where inside the entry the
-                // diagnostic starts. Using the entry start put every error in a long preserved
-                // run (comments, whitespace, long tokens) at the beginning of that run.
                 bool preserved = mapping.GeneratedLength == mapping.OriginalLength;
                 int startInEntry = preserved
                     ? Math.Clamp(generatedStart - mapping.GeneratedStart, 0, mapping.OriginalLength)
@@ -696,8 +656,6 @@ namespace CSX.LanguageServer
 
                 if (preserved)
                 {
-                    // generatedEnd is exclusive: look up the last character covered. Looking up
-                    // generatedEnd itself found the NEXT entry and overshot the range by one.
                     var endMapping = _resolver.FindGeneratedMapping(generatedPath, generatedEnd - 1);
                     if (endMapping != null && endMapping.GeneratedLength == endMapping.OriginalLength)
                     {
@@ -721,47 +679,6 @@ namespace CSX.LanguageServer
             end["line"] = mappedEndLine;
             end["character"] = mappedEndChar;
         }
-
-        private static string GetWordAtOffset(string text, int offset)
-        {
-            if (offset < 0 || offset > text.Length) return string.Empty;
-            int start = offset;
-            while (start > 0 && (char.IsLetterOrDigit(text[start - 1]) || text[start - 1] == '_')) start--;
-            int end = offset;
-            while (end < text.Length && (char.IsLetterOrDigit(text[end]) || text[end] == '_')) end++;
-            return text.Substring(start, end - start);
-        }
-
-        private static int FindClosestOccurrence(string text, string needle, int nearOffset)
-        {
-            if (needle.Length == 0 || text.Length < needle.Length) return -1;
-
-            int best = -1;
-            int bestDistance = int.MaxValue;
-            int index = 0;
-            while ((index = text.IndexOf(needle, index, StringComparison.Ordinal)) >= 0)
-            {
-                // Whole identifiers only ("id" must not match inside "valid"); C# is case-sensitive.
-                int endIndex = index + needle.Length;
-                bool wholeWord = (index == 0 || !IsWordChar(text[index - 1])) &&
-                                 (endIndex >= text.Length || !IsWordChar(text[endIndex]));
-                if (wholeWord)
-                {
-                    int distance = Math.Abs(index - nearOffset);
-                    if (distance < bestDistance)
-                    {
-                        bestDistance = distance;
-                        best = index;
-                    }
-                }
-                index++;
-            }
-
-            // Avoid snapping to an unrelated identifier far away.
-            return bestDistance <= 4000 ? best : -1;
-        }
-
-        private static bool IsWordChar(char c) => char.IsLetterOrDigit(c) || c == '_';
 
         private string ReadOriginalText(string originalPath)
         {
@@ -815,7 +732,6 @@ namespace CSX.LanguageServer
             if (_generatedToOriginal.TryGetValue(path, out var orig)) return PathToUri(orig);
             if (path.EndsWith(".generated.cs", StringComparison.OrdinalIgnoreCase))
             {
-                // derive original
                 var root = _options.ProjectRoot;
                 var rel = Path.GetRelativePath(Path.Combine(root, _options.OutputDirectory), path);
                 if (rel.EndsWith(".generated.cs", StringComparison.OrdinalIgnoreCase))
@@ -862,9 +778,6 @@ namespace CSX.LanguageServer
             var path = UriToPath(generatedUri);
             if (_generatedToOriginal.TryGetValue(path, out var orig)) return orig;
 
-            // The URI dictionaries are not always populated before didOpen (for example after
-            // a server restart). Derive the source path structurally so we never re-transform
-            // the generated file as if it were .cx source.
             if (path.EndsWith(".generated.cs", StringComparison.OrdinalIgnoreCase))
             {
                 var outputDir = Path.Combine(_options.ProjectRoot, _options.OutputDirectory);
@@ -885,10 +798,8 @@ namespace CSX.LanguageServer
         {
             try
             {
-                // VS Code may send the drive-letter colon percent-encoded (%3A).
                 var unescaped = Uri.UnescapeDataString(uri);
                 var path = new Uri(unescaped).LocalPath;
-                // Normalize forward slashes and strip a leading slash before a drive letter.
                 path = path.Replace('/', '\\');
                 if (path.Length >= 3 && path[0] == '\\' && char.IsLetter(path[1]) && path[2] == ':')
                 {
@@ -903,7 +814,5 @@ namespace CSX.LanguageServer
         {
             return new Uri(path).AbsoluteUri;
         }
-
-        private string fileUriGeneratedToOriginal(string uri) => GetOriginalUri(uri);
     }
 }

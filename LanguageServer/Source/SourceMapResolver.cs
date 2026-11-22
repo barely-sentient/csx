@@ -64,7 +64,6 @@ namespace CSX.LanguageServer
                 {
                     if (m.GeneratedLength != m.OriginalLength)
                     {
-                        // Transformed entry: map to start of generated (stable anchor).
                         if (originalOffset == m.OriginalStart)
                         {
                             return m.GeneratedStart;

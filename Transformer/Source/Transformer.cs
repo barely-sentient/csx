@@ -65,15 +65,16 @@ namespace CSX.Transformer
                     sb.Append(element);
                     if (i > 0 && i - 1 < tokens.Count)
                     {
-                        pos = tokens[i - 1].StartPosition + tokens[i - 1].Length;
+                        pos = Math.Max(pos, tokens[i - 1].StartPosition + tokens[i - 1].Length);
                     }
                 }
                 else
                 {
                     int genStart = sb.Length;
-                    sb.Append(t.Text);
-                    map.Add(genStart, (t.Text ?? "").Length, t.StartPosition, t.Length);
-                    pos = t.StartPosition + t.Length;
+                    string tokText = t.Text ?? "";
+                    sb.Append(tokText);
+                    map.Add(genStart, tokText.Length, t.StartPosition, t.Length);
+                    pos = Math.Max(pos, t.StartPosition + t.Length);
                     i++;
                 }
             }
@@ -420,14 +421,15 @@ namespace CSX.Transformer
                     sb.Append(elem);
                     if (i > 0 && i - 1 < tokens.Count)
                     {
-                        pos = tokens[i - 1].StartPosition + tokens[i - 1].Length;
+                        pos = Math.Max(pos, tokens[i - 1].StartPosition + tokens[i - 1].Length);
                     }
                     continue;
                 }
 
-                local?.Add(sb.Length, (t.Text ?? "").Length, t.StartPosition, t.Length);
-                sb.Append(t.Text);
-                pos = t.StartPosition + t.Length;
+                string tokText = t.Text ?? "";
+                local?.Add(sb.Length, tokText.Length, t.StartPosition, t.Length);
+                sb.Append(tokText);
+                pos = Math.Max(pos, t.StartPosition + t.Length);
                 i++;
 
                 if (t.Kind == TokenKind.OpenBrace)
