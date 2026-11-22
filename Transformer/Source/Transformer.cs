@@ -40,7 +40,7 @@ namespace CSX.Transformer
                 {
                     int genStart = sb.Length;
                     int origStart = t.StartPosition;
-                    string element = TransformElement(source, tokens, ref i, config);
+                    string element = TransformElement(source, tokens, ref i, config, map, genStart, origStart);
                     sb.Append(element);
                     int origEnd = i > 0 ? tokens[i - 1].StartPosition + tokens[i - 1].Length : origStart;
                     map.Add(genStart, element.Length, origStart, origEnd - origStart);
@@ -75,7 +75,7 @@ namespace CSX.Transformer
             return TransformWithSourceMap(source, tokens, config).Text;
         }
 
-        private static string TransformElement(string source, List<Token> tokens, ref int i, TransformConfig config)
+        private static string TransformElement(string source, List<Token> tokens, ref int i, TransformConfig config, SourceMap? map = null, int genBase = 0, int origBase = 0)
         {
             int count = tokens.Count;
             // i at JsxOpenBracket
@@ -128,10 +128,13 @@ namespace CSX.Transformer
 
             bool isComponent = false;
             string tagName = "";
+             int origTagNameStart = -1;
             if (i < count && tokens[i].Kind == TokenKind.JsxComponentName)
             {
                 isComponent = true;
                 tagName = tokens[i].Text ?? "";
+                 origTagNameStart = tokens[i].StartPosition;
+                origTagNameStart = tokens[i].StartPosition;
                 i++;
             }
             else if (i < count && tokens[i].Kind == TokenKind.JsxTagName)
@@ -222,6 +225,11 @@ namespace CSX.Transformer
                     }
                     sb.Append(')');
                 }
+                if (map != null && origTagNameStart >= 0 && tagName.Length > 0)
+                {
+                    int genOffset = isComponent ? 3 : 4;
+                    map.Add(genBase + genOffset, tagName.Length, origTagNameStart, tagName.Length);
+                }
                 return sb.ToString();
             }
 
@@ -288,6 +296,11 @@ namespace CSX.Transformer
                 result.Append(", ").Append(child);
             }
             result.Append(')');
+            if (map != null && origTagNameStart >= 0 && tagName.Length > 0)
+            {
+                int genOffset = isComponent ? 3 : 4;
+                map.Add(genBase + genOffset, tagName.Length, origTagNameStart, tagName.Length);
+            }
             return result.ToString();
         }
 

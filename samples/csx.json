@@ -1,7 +1,7 @@
 {
-  "FrameworkHtmlClass": "_",
-  "FrameworkHtmlClassMethod": "H",
-  "FrameworkComponentMethod": "C",
-  "FrameworkFragmentMethod": "F",
+  "FrameworkHtmlClass": "React",
+  "FrameworkHtmlClassMethod": "CreateElement",
+  "FrameworkComponentMethod": "CreateElement",
+  "FrameworkFragmentMethod": "Fragment",
   "GeneratedFileOutput": "src/generated"
 }

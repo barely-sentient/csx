@@ -199,14 +199,14 @@
             "1": { "name": "punctuation.definition.parameters.begin.cx" },
             "2": { "patterns": [{ "include": "#lambda-params" }] },
             "3": { "name": "punctuation.definition.parameters.end.cx" },
-            "4": { "name": "storage.type.function.arrow.cx" }
+            "4": { "name": "storage.type.function.arrow.cx keyword.operator.arrow.cx" }
           }
         },
         {
           "match": "\\b([A-Za-z_]\\w*)\\s*(=>)",
           "captures": {
             "1": { "name": "variable.parameter.cx" },
-            "2": { "name": "storage.type.function.arrow.cx" }
+            "2": { "name": "storage.type.function.arrow.cx keyword.operator.arrow.cx" }
           }
         }
       ]
@@ -232,7 +232,7 @@
 
     "operators": {
       "patterns": [
-        { "name": "storage.type.function.arrow.cx", "match": "=>" },
+        { "name": "storage.type.function.arrow.cx keyword.operator.arrow.cx", "match": "=>" },
         { "name": "keyword.operator.spread.cx", "match": "\\.\\.\\.|\\.\\." },
         { "name": "keyword.operator.null-conditional.cx", "match": "\\?\\?=?|\\?\\." },
         { "name": "keyword.operator.assignment.compound.cx", "match": "<<=|>>=|\\+=|-=|\\*=|/=|%=|&=|\\|=|\\^=" },
