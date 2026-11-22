@@ -17,6 +17,10 @@ class CxLspServerSupportProvider : LspServerSupportProvider {
 
     override fun fileOpened(project: Project, file: VirtualFile, starter: LspServerSupportProvider.LspServerStarter) {
         if (!CxFileUtil.isCxFile(file)) return
+        if (CxFileUtil.isIgnoredCxPath(file)) {
+            log.info("CSX LSP: ignored build/debug fixture ${file.path}")
+            return
+        }
 
         log.info("CSX LSP: fileOpened ${file.path}; starting language server")
         starter.ensureServerStarted(CxLspServerDescriptor(project, file))

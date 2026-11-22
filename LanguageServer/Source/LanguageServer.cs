@@ -51,6 +51,16 @@ namespace CSX.LanguageServer
                     };
                     psi.ArgumentList.Add("--stdio");
                     _csharpServer = Process.Start(psi);
+                    if (_csharpServer != null)
+                    {
+                        // stderr is redirected, so it must be drained: once the pipe buffer fills,
+                        // the backend blocks on its next log write and the whole server hangs.
+                        _csharpServer.ErrorDataReceived += (_, e) =>
+                        {
+                            if (e.Data != null) Console.Error.WriteLine("roslyn: " + e.Data);
+                        };
+                        _csharpServer.BeginErrorReadLine();
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -60,6 +70,14 @@ namespace CSX.LanguageServer
             }
 
             _runTask = Task.Run(() => RunLoopAsync(_cts.Token), _cts.Token);
+        }
+
+        // "2.100.1" must sort above "2.99.0"; a plain string sort gets that backwards.
+        private static Version ExtensionVersion(string exePath)
+        {
+            var dirName = Path.GetFileName(Path.GetDirectoryName(Path.GetDirectoryName(exePath)) ?? "");
+            var match = Regex.Match(dirName, @"csharp-(\d+(?:\.\d+){1,3})");
+            return match.Success && Version.TryParse(match.Groups[1].Value, out var v) ? v : new Version(0, 0);
         }
 
         private static string? FindRoslynLanguageServer()
@@ -85,7 +103,7 @@ namespace CSX.LanguageServer
                     }
                     if (candidates.Count > 0)
                     {
-                        return candidates.OrderByDescending(p => p).First();
+                        return candidates.OrderByDescending(ExtensionVersion).ThenByDescending(p => p, StringComparer.Ordinal).First();
                     }
                 }
             }
@@ -158,7 +176,12 @@ namespace CSX.LanguageServer
                 sb.AppendLine("  <ItemGroup>");
                 sb.AppendLine("    <Compile Include=\"**/*.generated.cs\" />");
                 // Include real .cs files from the project root, excluding bin/obj and the output dir.
-                sb.AppendLine("    <Compile Include=\"../../**/*.cs\" Exclude=\"../../bin/**;../../obj/**;../../**/bin/**;../../**/obj/**;../../**/Debug/**;../../**/Release/**\" />");
+                // The root is located relative to the generated project, whatever depth the output
+                // directory has, and the output directory is excluded so generated files are not
+                // compiled twice (a duplicate Compile item is a build error).
+                var up = Path.GetRelativePath(outputDir, root).Replace('\\', '/').TrimEnd('/');
+                var outRel = Path.GetRelativePath(root, outputDir).Replace('\\', '/').TrimEnd('/');
+                sb.AppendLine($"    <Compile Include=\"{up}/**/*.cs\" Exclude=\"{up}/bin/**;{up}/obj/**;{up}/**/bin/**;{up}/**/obj/**;{up}/**/Debug/**;{up}/**/Release/**;{up}/{outRel}/**\" />");
                 sb.AppendLine("  </ItemGroup>");
 
                 if (packageRefs.Count > 0 || frameworkRefs.Count > 0)
@@ -258,6 +281,10 @@ namespace CSX.LanguageServer
                 _options.TransformConfig ??= new CSX.Transformer.TransformConfig();
             }
             _options.TransformConfig ??= new CSX.Transformer.TransformConfig();
+            if (!string.IsNullOrWhiteSpace(_options.TransformConfig.GeneratedFileOutput))
+            {
+                _options.OutputDirectory = _options.TransformConfig.GeneratedFileOutput!;
+            }
         }
 
         private async Task TransformAllAsync(CancellationToken ct)
@@ -370,10 +397,14 @@ namespace CSX.LanguageServer
             using var stdout = Console.OpenStandardOutput();
             while (!ct.IsCancellationRequested)
             {
-                var doc = await LspProxy.ReadMessageAsync(stdin, ct).ConfigureAwait(false);
+                using var doc = await LspProxy.ReadMessageAsync(stdin, ct).ConfigureAwait(false);
                 if (doc == null) break;
                 var message = doc.RootElement;
                 var method = message.TryGetProperty("method", out var m) ? m.GetString() : null;
+
+                // A message without a method is a client *response*; answering it with a null
+                // result (the default case below) sends the client a bogus reply.
+                if (method == null) continue;
                 JsonElement? id = message.TryGetProperty("id", out var i) ? i.Clone() : (JsonElement?)null;
 
                 string idJson = id.HasValue ? id.Value.GetRawText() : "null";
@@ -614,7 +645,10 @@ namespace CSX.LanguageServer
                         {
                             openTags.Push((name, nameStart));
                         }
-                        i = k;
+                        bool cutShort = k < tokens.Count &&
+                            (tokens[k].Kind == CSX.Parser.TokenKind.JsxOpenBracket ||
+                             tokens[k].Kind == CSX.Parser.TokenKind.JsxCloseTagOpen);
+                        i = cutShort ? k - 1 : k;
                     }
                     else if (token.Kind == CSX.Parser.TokenKind.JsxCloseTagOpen)
                     {
@@ -742,9 +776,16 @@ namespace CSX.LanguageServer
                         j++;
                     }
 
-                    int tagEnd = j < tokens.Count
-                        ? tokens[j].StartPosition + tokens[j].Length
-                        : source.Length;
+                    // A malformed tag can be cut short by the next '<' or '</'. That token starts
+                    // something new: don't blank it, and don't skip it in the outer loop.
+                    bool cutShort = j < tokens.Count &&
+                        (tokens[j].Kind == CSX.Parser.TokenKind.JsxOpenBracket ||
+                         tokens[j].Kind == CSX.Parser.TokenKind.JsxCloseTagOpen);
+                    int tagEnd = j >= tokens.Count
+                        ? source.Length
+                        : cutShort
+                            ? tokens[j].StartPosition
+                            : tokens[j].StartPosition + tokens[j].Length;
 
                     if (selfClosing)
                     {
@@ -754,7 +795,7 @@ namespace CSX.LanguageServer
                     {
                         openTags.Push(start);
                     }
-                    i = j;
+                    i = cutShort ? j - 1 : j;
                 }
                 else if (token.Kind == CSX.Parser.TokenKind.JsxCloseTagOpen)
                 {
@@ -820,7 +861,7 @@ namespace CSX.LanguageServer
             }
         }
 
-        private static IEnumerable<string> EnumerateSourceFiles(string root)
+        private static IEnumerable<string> EnumerateSourceFiles(string root, string? excludeDirectory = null)
         {
             var pending = new Stack<string>();
             pending.Push(root);
@@ -861,6 +902,12 @@ namespace CSX.LanguageServer
                 foreach (var subdirectory in subdirectories)
                 {
                     var name = Path.GetFileName(subdirectory);
+                    if (excludeDirectory != null &&
+                        string.Equals(Path.GetFullPath(subdirectory).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+                                      excludeDirectory, StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
                     if (name.Equals("bin", StringComparison.OrdinalIgnoreCase) ||
                         name.Equals("obj", StringComparison.OrdinalIgnoreCase) ||
                         name.Equals("node_modules", StringComparison.OrdinalIgnoreCase) ||
@@ -883,7 +930,11 @@ namespace CSX.LanguageServer
 
             if (sourceDirectory != null && Directory.Exists(sourceDirectory))
             {
-                foreach (var file in EnumerateSourceFiles(sourceDirectory))
+                // Skip the generated-output directory: its .generated.cs files duplicate the
+                // projected .cx files and produce bogus duplicate-definition errors.
+                var generatedDirectory = Path.GetFullPath(Path.Combine(_options.ProjectRoot, _options.OutputDirectory))
+                    .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                foreach (var file in EnumerateSourceFiles(sourceDirectory, generatedDirectory))
                 {
                     try
                     {
@@ -1084,6 +1135,8 @@ namespace CSX.LanguageServer
 
         private List<CompletionItem> BuildCompletions(string text, int line, int character, string uri)
         {
+            // Source-map original offsets are relative to LF-normalized text.
+            text = text.Replace("\r\n", "\n").Replace('\r', '\n');
             int offset = PositionToOffset(text, line, character);
             int lastOpen = offset > 0 ? text.LastIndexOf('<', offset - 1) : -1;
             int lastClose = offset > 0 ? text.LastIndexOf('>', offset - 1) : -1;

@@ -24,7 +24,26 @@ Choose one of these setups:
 The transformer is configured by `csx.json` in the project root. The language server creates a
 default file if one does not exist; see the [root README](../README.md#csxjson) for the options.
 
-## Getting the artifacts
+## One-command install
+
+The CLI can download and install the plugin that matches its own version:
+
+```bash
+csx enable vscode
+csx enable rider
+```
+
+It downloads `csx-vscode-<version>.vsix` / `csx-rider-<version>.zip` from the `v<version>`
+GitHub Release published by the tag build of `.github/workflows/build-ide-plugins.yml`.
+Override the version with `--version 1.2.3` or `--version latest`, and override the source
+repository with `--repo owner/name`. Run `csx enable --help` for all options.
+
+Useful environment overrides: `CSX_VERSION`, `CSX_REPOSITORY`, `CSX_VSCODE_BIN`,
+`CSX_RIDER_BIN`, and `CSX_RIDER_PLUGINS_DIR`. The Rider command tries
+`rider installPlugin` first and falls back to unpacking the plugin into the detected
+Rider `plugins` directory; close Rider before the fallback if it is running.
+
+## Getting the artifacts manually
 
 The workflow `.github/workflows/build-ide-plugins.yml` builds both artifacts on pushes to
 `main`/`master`, on `v*` tags, on pull requests, and on demand:

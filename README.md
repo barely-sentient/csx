@@ -42,7 +42,8 @@ Open the settings panel via `CSX: Open Settings` to configure.
 ## Editor extension builds and installation
 
 CI builds both the VS Code VSIX and the Rider plugin in one workflow
-(`.github/workflows/build-ide-plugins.yml`). See [`IDE/README.md`](IDE/README.md) for
+(`.github/workflows/build-ide-plugins.yml`). Install the matching versions with
+`csx enable vscode` or `csx enable rider`. See [`IDE/README.md`](IDE/README.md) for
 download links, installation steps, server configuration and local build instructions.
 
 ## csx.json

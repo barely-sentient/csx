@@ -17,6 +17,15 @@ namespace CSX.LanguageServer
         private System.Threading.Tasks.TaskCompletionSource<bool>? _projectReady;
         private readonly Dictionary<int, string> _requestUris = new();
         private string? _currentMethod;
+        private readonly object _rewriteLock = new();
+
+        // Latest editor buffer for each open source file (LF-normalized). Positions from the
+        // client refer to the buffer, which differs from the file on disk while it has unsaved edits.
+        private readonly Dictionary<string, string> _openText = new(StringComparer.OrdinalIgnoreCase);
+
+        // A backend read that outlived a handshake timeout. It must be consumed by the next reader
+        // rather than abandoned, otherwise a message is lost or two readers race on one stream.
+        private Task<JsonDocument?>? _pendingBackendRead;
 
         public LspProxy(LanguageServerOptions options, SourceMapResolver resolver)
         {
@@ -47,12 +56,11 @@ namespace CSX.LanguageServer
                     var deadline = DateTime.UtcNow.AddSeconds(10);
                     while (initResp == null && DateTime.UtcNow < deadline && !ct.IsCancellationRequested)
                     {
-                        using var tcts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                        tcts.CancelAfter(TimeSpan.FromSeconds(3));
-                        JsonDocument? msg = null;
-                        try { msg = await ReadMessageAsync(backendOut, tcts.Token).ConfigureAwait(false); }
-                        catch (OperationCanceledException) { msg = null; }
-                        if (msg == null) break;
+                        // Wait for the whole remaining window; the old 3s per-read timeout gave up
+                        // on a backend that was merely slow to start, so the client never got its
+                        // initialize response.
+                        var (timedOut, msg) = await ReadBackendAsync(backendOut, deadline - DateTime.UtcNow, ct).ConfigureAwait(false);
+                        if (timedOut || msg == null) break;
                         if (initIdRaw != null && msg.RootElement.TryGetProperty("id", out var rid) &&
                             rid.GetRawText() == initIdRaw &&
                             !msg.RootElement.TryGetProperty("method", out _))
@@ -97,12 +105,8 @@ namespace CSX.LanguageServer
                         var pdeadline = DateTime.UtcNow.AddSeconds(5);
                         while (DateTime.UtcNow < pdeadline && !ct.IsCancellationRequested)
                         {
-                            using var tcts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                            tcts.CancelAfter(TimeSpan.FromSeconds(2));
-                            JsonDocument? msg = null;
-                            try { msg = await ReadMessageAsync(backendOut, tcts.Token).ConfigureAwait(false); }
-                            catch (OperationCanceledException) { msg = null; }
-                            if (msg == null) break;
+                            var (timedOut, msg) = await ReadBackendAsync(backendOut, pdeadline - DateTime.UtcNow, ct).ConfigureAwait(false);
+                            if (timedOut || msg == null) break;
                             if (msg.RootElement.TryGetProperty("method", out var pm) && pm.GetString() == "workspace/projectInitializationComplete")
                             {
                                 _projectReady?.TrySetResult(true);
@@ -153,11 +157,36 @@ namespace CSX.LanguageServer
             await Task.WhenAny(c2s, s2c).ConfigureAwait(false);
         }
 
+        // Reads one backend message, giving up after `timeout` WITHOUT cancelling the read: a
+        // cancelled ReadAsync can swallow part of a message. The read stays pending and is picked up
+        // by the next call (or by the server->client pump).
+        private async Task<(bool TimedOut, JsonDocument? Doc)> ReadBackendAsync(Stream backendOut, TimeSpan timeout, CancellationToken ct)
+        {
+            if (timeout < TimeSpan.Zero) timeout = TimeSpan.Zero;
+            _pendingBackendRead ??= ReadMessageAsync(backendOut, ct);
+            var pending = _pendingBackendRead;
+            var completed = await Task.WhenAny(pending, Task.Delay(timeout, ct)).ConfigureAwait(false);
+            if (completed != pending) return (true, null);
+
+            _pendingBackendRead = null;
+            return (false, await pending.ConfigureAwait(false));
+        }
+
         private async Task PumpAsync(Stream input, Stream output, bool clientToServer, CancellationToken ct)
         {
             while (!ct.IsCancellationRequested)
             {
-                var doc = await ReadMessageAsync(input, ct).ConfigureAwait(false);
+                JsonDocument? doc;
+                var pendingRead = !clientToServer ? _pendingBackendRead : null;
+                if (pendingRead != null)
+                {
+                    _pendingBackendRead = null;
+                    doc = await pendingRead.ConfigureAwait(false);
+                }
+                else
+                {
+                    doc = await ReadMessageAsync(input, ct).ConfigureAwait(false);
+                }
                 if (doc == null) break;
 
                 // Drop responses to injected warm-up requests so they don't reach the client.
@@ -180,12 +209,12 @@ namespace CSX.LanguageServer
                 try
                 {
                     Console.Error.WriteLine("proxy: " + (clientToServer ? "C->S" : "S->C") + " " + (doc.RootElement.TryGetProperty("method", out var _mm) ? _mm.GetString() : "response id=" + (doc.RootElement.TryGetProperty("id", out var _ii) ? _ii.GetRawText() : "?")) + " | " + doc.RootElement.GetRawText().Substring(0, Math.Min(120, doc.RootElement.GetRawText().Length)));
-                    var rewritten = RewriteMessage(doc, clientToServer);
+                    var rewritten = RewriteMessage(doc, clientToServer, out var handledMethod);
                     await WriteMessageAsync(output, rewritten, ct).ConfigureAwait(false);
 
                     // didSave regenerates the file on disk; push that text to the C# backend
                     // as a full didChange so diagnostics refresh without another edit.
-                    if (clientToServer && _currentMethod == "textDocument/didSave" &&
+                    if (clientToServer && handledMethod == "textDocument/didSave" &&
                         rewritten.RootElement.TryGetProperty("params", out var saveParams) &&
                         saveParams.TryGetProperty("textDocument", out var saveDoc) &&
                         saveDoc.TryGetProperty("uri", out var saveUriNode))
@@ -286,7 +315,23 @@ namespace CSX.LanguageServer
             await stream.FlushAsync(ct).ConfigureAwait(false);
         }
 
-        private JsonDocument RewriteMessage(JsonDocument doc, bool clientToServer)
+        private JsonDocument RewriteMessage(JsonDocument doc, bool clientToServer) =>
+            RewriteMessage(doc, clientToServer, out _);
+
+        // Both pump directions rewrite messages concurrently, and rewriting touches shared state
+        // (_currentMethod, _requestUris, the path maps). Serialize it, and hand the method back to
+        // the caller instead of having it read a field another thread may have overwritten.
+        private JsonDocument RewriteMessage(JsonDocument doc, bool clientToServer, out string? method)
+        {
+            lock (_rewriteLock)
+            {
+                var result = RewriteMessageCore(doc, clientToServer);
+                method = _currentMethod;
+                return result;
+            }
+        }
+
+        private JsonDocument RewriteMessageCore(JsonDocument doc, bool clientToServer)
         {
             var node = JsonNode.Parse(doc.RootElement.GetRawText());
             if (node == null) return doc;
@@ -401,6 +446,12 @@ namespace CSX.LanguageServer
                     if (reqUri != null) _requestUris[ridInt] = reqUri;
                 }
 
+                if (clientToServer && _currentMethod == "textDocument/didClose" && uri != null &&
+                    uri.EndsWith(".generated.cs", StringComparison.OrdinalIgnoreCase))
+                {
+                    _openText.Remove(GetOriginalPath(uri));
+                }
+
                 // didOpen: always regenerate from the current source and nearest csx.json
                 if (clientToServer && obj.TryGetPropertyValue("text", out var textNode) && textNode is JsonValue tv && tv.TryGetValue<string>(out var originalText))
                 {
@@ -408,7 +459,15 @@ namespace CSX.LanguageServer
                     {
                         var genPath = UriToPath(uri);
                         var origPath = GetOriginalPath(uri);
-                        var source = File.Exists(origPath) ? File.ReadAllText(origPath) : originalText;
+
+                        // When the client opened the .cx file itself, its text IS the current
+                        // buffer. Only fall back to disk if it opened the generated file directly.
+                        bool openedFromSource = originalUriForTracking != null &&
+                            originalUriForTracking.EndsWith(_options.FileExtension, StringComparison.OrdinalIgnoreCase);
+                        var source = openedFromSource
+                            ? originalText
+                            : (File.Exists(origPath) ? File.ReadAllText(origPath) : originalText);
+                        if (openedFromSource) _openText[origPath] = NormalizeLineEndings(originalText);
                         WriteGenerated(genPath, origPath, source);
                         obj["text"] = File.ReadAllText(genPath);
                     }
@@ -432,7 +491,10 @@ namespace CSX.LanguageServer
                             if (uri != null && uri.EndsWith(".generated.cs", StringComparison.OrdinalIgnoreCase))
                             {
                                 var genPath = UriToPath(uri);
-                                WriteGenerated(genPath, GetOriginalPath(uri), ct);
+                                var changedOrigPath = GetOriginalPath(uri);
+                                if (changedOrigPath.EndsWith(_options.FileExtension, StringComparison.OrdinalIgnoreCase))
+                                    _openText[changedOrigPath] = NormalizeLineEndings(ct);
+                                WriteGenerated(genPath, changedOrigPath, ct);
                                 co["text"] = File.ReadAllText(genPath);
                             }
                             else if (uri != null && uri.EndsWith(_options.FileExtension, StringComparison.OrdinalIgnoreCase))
@@ -518,9 +580,14 @@ namespace CSX.LanguageServer
                 generatedPath = GetGeneratedPath(originalPath);
             }
 
+            // Only .cx files have a generated counterpart. Positions in plain .cs files (for example
+            // a definition or reference that lands in one) must pass through untouched; mapping
+            // them against a non-existent generated file collapsed them onto line 0.
+            if (!originalPath.EndsWith(_options.FileExtension, StringComparison.OrdinalIgnoreCase)) return;
+
             _resolver.Load(generatedPath);
 
-            string originalText = NormalizeLineEndings(File.Exists(originalPath) ? File.ReadAllText(originalPath) : "");
+            string originalText = ReadOriginalText(originalPath);
             string generatedText = NormalizeLineEndings(File.Exists(generatedPath) ? File.ReadAllText(generatedPath) : "");
 
             int offset = clientToServer
@@ -532,16 +599,17 @@ namespace CSX.LanguageServer
             {
                 mappedOffset = _resolver.ToGenerated(generatedPath, offset);
 
-                // Source maps only track whole JSX nodes, so an identifier inside a tag
-                // can land at the start of the generated React.CreateElement call. Roslyn
-                // then sees whitespace and returns no completions/hover. Snap the caret
-                // onto the same identifier text in the generated document.
+                // If the mapped position is not on the same identifier (an unmapped region, or
+                // a rewritten node), snap the caret onto the nearest matching identifier in the
+                // generated document. Skip this when the mapping is already exact: snapping then
+                // jumped to a *closer* occurrence of the same word, e.g. the next "foo" in "foo foo".
                 if (_currentMethod is "textDocument/completion" or "textDocument/hover" or
                     "textDocument/definition" or "textDocument/references" or
                     "textDocument/rename" or "textDocument/signatureHelp")
                 {
                     var word = GetWordAtOffset(originalText, offset);
-                    if (word.Length > 0)
+                    if (word.Length > 0 &&
+                        !string.Equals(GetWordAtOffset(generatedText, mappedOffset), word, StringComparison.Ordinal))
                     {
                         var snapped = FindClosestOccurrence(generatedText, word, mappedOffset);
                         if (snapped >= 0) mappedOffset = snapped + word.Length;
@@ -578,10 +646,11 @@ namespace CSX.LanguageServer
             }
 
             var originalPath = UriToPath(uri);
+            if (!originalPath.EndsWith(_options.FileExtension, StringComparison.OrdinalIgnoreCase)) return;
             var generatedPath = GetGeneratedPath(originalPath);
             _resolver.Load(generatedPath);
 
-            string originalText = NormalizeLineEndings(File.Exists(originalPath) ? File.ReadAllText(originalPath) : "");
+            string originalText = ReadOriginalText(originalPath);
             string generatedText = NormalizeLineEndings(File.Exists(generatedPath) ? File.ReadAllText(generatedPath) : "");
 
             int generatedStart = PositionToOffset(generatedText, startLine, startChar);
@@ -596,7 +665,8 @@ namespace CSX.LanguageServer
                 originalStart = Math.Clamp(generatedStart, 0, originalText.Length);
                 originalEnd = Math.Clamp(generatedEnd, 0, originalText.Length);
             }
-            else if (mapping.OriginalLength <= 1 || mapping.GeneratedLength <= 0)
+            else if ((mapping.OriginalLength <= 1 && mapping.GeneratedLength != mapping.OriginalLength) ||
+                     mapping.GeneratedLength <= 0)
             {
                 // Every generated fragment for a JSX node is anchored to the original '<'.
                 originalStart = Math.Clamp(mapping.OriginalStart, 0, originalText.Length);
@@ -604,26 +674,35 @@ namespace CSX.LanguageServer
             }
             else
             {
-                originalStart = Math.Clamp(mapping.OriginalStart, 0, originalText.Length);
+                // Preserved (1:1) entries map exactly, so honour where inside the entry the
+                // diagnostic starts. Using the entry start put every error in a long preserved
+                // run (comments, whitespace, long tokens) at the beginning of that run.
+                bool preserved = mapping.GeneratedLength == mapping.OriginalLength;
+                int startInEntry = preserved
+                    ? Math.Clamp(generatedStart - mapping.GeneratedStart, 0, mapping.OriginalLength)
+                    : 0;
+                originalStart = Math.Clamp(mapping.OriginalStart + startInEntry, 0, originalText.Length);
+
                 int generatedSpan = Math.Min(
                     Math.Max(1, generatedEnd - generatedStart),
                     Math.Max(1, mapping.GeneratedStart + mapping.GeneratedLength - generatedStart));
-                int originalSpan = Math.Clamp(
-                    (int)Math.Round((double)generatedSpan / mapping.GeneratedLength * mapping.OriginalLength),
-                    1,
-                    mapping.OriginalLength);
+                int originalSpan = preserved
+                    ? Math.Clamp(generatedSpan, 1, Math.Max(1, mapping.OriginalLength - startInEntry))
+                    : Math.Clamp(
+                        (int)Math.Round((double)generatedSpan / mapping.GeneratedLength * mapping.OriginalLength),
+                        1,
+                        mapping.OriginalLength);
                 originalEnd = Math.Min(originalText.Length, originalStart + originalSpan);
 
-                // Preserved text can use the exact end mapping when one exists.
-                if (mapping.GeneratedLength == mapping.OriginalLength)
+                if (preserved)
                 {
-                    var endMapping = _resolver.FindGeneratedMapping(generatedPath, generatedEnd);
-                    if (endMapping != null &&
-                        endMapping.GeneratedLength == endMapping.OriginalLength &&
-                        endMapping.OriginalStart >= originalStart)
+                    // generatedEnd is exclusive: look up the last character covered. Looking up
+                    // generatedEnd itself found the NEXT entry and overshot the range by one.
+                    var endMapping = _resolver.FindGeneratedMapping(generatedPath, generatedEnd - 1);
+                    if (endMapping != null && endMapping.GeneratedLength == endMapping.OriginalLength)
                     {
-                        int offsetInEntry = Math.Clamp(generatedEnd - endMapping.GeneratedStart, 0, endMapping.OriginalLength);
-                        var candidate = Math.Min(originalText.Length, endMapping.OriginalStart + Math.Max(1, offsetInEntry));
+                        int endInEntry = Math.Clamp(generatedEnd - endMapping.GeneratedStart, 1, endMapping.OriginalLength);
+                        var candidate = Math.Min(originalText.Length, endMapping.OriginalStart + endInEntry);
                         if (candidate > originalStart) originalEnd = candidate;
                     }
                 }
@@ -660,19 +739,34 @@ namespace CSX.LanguageServer
             int best = -1;
             int bestDistance = int.MaxValue;
             int index = 0;
-            while ((index = text.IndexOf(needle, index, StringComparison.OrdinalIgnoreCase)) >= 0)
+            while ((index = text.IndexOf(needle, index, StringComparison.Ordinal)) >= 0)
             {
-                int distance = Math.Abs(index - nearOffset);
-                if (distance < bestDistance)
+                // Whole identifiers only ("id" must not match inside "valid"); C# is case-sensitive.
+                int endIndex = index + needle.Length;
+                bool wholeWord = (index == 0 || !IsWordChar(text[index - 1])) &&
+                                 (endIndex >= text.Length || !IsWordChar(text[endIndex]));
+                if (wholeWord)
                 {
-                    bestDistance = distance;
-                    best = index;
+                    int distance = Math.Abs(index - nearOffset);
+                    if (distance < bestDistance)
+                    {
+                        bestDistance = distance;
+                        best = index;
+                    }
                 }
-                index += needle.Length;
+                index++;
             }
 
             // Avoid snapping to an unrelated identifier far away.
             return bestDistance <= 4000 ? best : -1;
+        }
+
+        private static bool IsWordChar(char c) => char.IsLetterOrDigit(c) || c == '_';
+
+        private string ReadOriginalText(string originalPath)
+        {
+            if (_openText.TryGetValue(originalPath, out var open)) return open;
+            return NormalizeLineEndings(File.Exists(originalPath) ? File.ReadAllText(originalPath) : "");
         }
 
         private static string NormalizeLineEndings(string text) =>

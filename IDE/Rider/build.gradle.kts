@@ -5,7 +5,9 @@ plugins {
 }
 
 group = "com.donkeh"
-version = "0.0.1"
+version = providers.environmentVariable("CSX_PLUGIN_VERSION")
+    .orElse(providers.gradleProperty("csx.pluginVersion"))
+    .getOrElse("0.0.1")
 
 repositories {
     mavenCentral()

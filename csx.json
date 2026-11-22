@@ -3,5 +3,5 @@
   "FrameworkHtmlClassMethod": "H",
   "FrameworkComponentMethod": "C",
   "FrameworkFragmentMethod": "F",
-  "GeneratedFileOutput": "src/generated"
+  "GeneratedFileOutput": "obj/csx"
 }

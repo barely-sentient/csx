@@ -3,5 +3,5 @@
   "FrameworkHtmlClassMethod": "CreateElement",
   "FrameworkComponentMethod": "CreateElement",
   "FrameworkFragmentMethod": "Fragment",
-  "GeneratedFileOutput": "src/generated"
+  "GeneratedFileOutput": "obj/csx"
 }

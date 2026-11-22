@@ -23,6 +23,9 @@ The downloaded platform version can be changed with `CSX_RIDER_PLATFORM_VERSION`
 
 ## Install
 
+The released plugin matching the installed CLI version can be installed with `csx enable rider`
+(see [`../README.md`](../README.md)). To install a locally built ZIP:
+
 1. Build the plugin ZIP.
 2. In Rider, go to **Settings | Plugins | ⚙ | Install Plugin from Disk...** and select the ZIP.
 3. Restart Rider.

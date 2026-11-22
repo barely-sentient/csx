@@ -21,8 +21,25 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  version:
+    name: Determine plugin version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Resolve version from tag
+        id: version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=0.0.1" >> "$GITHUB_OUTPUT"
+          fi
+
   vsix:
     name: VS Code extension (VSIX)
+    needs: version
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -39,23 +56,28 @@ jobs:
         working-directory: IDE/VsCode
         run: npm ci
 
+      - name: Apply version
+        working-directory: IDE/VsCode
+        run: npm version "${{ needs.version.outputs.version }}" --no-git-tag-version --allow-same-version
+
       - name: Compile
         working-directory: IDE/VsCode
         run: npm run compile
 
       - name: Package VSIX
         working-directory: IDE/VsCode
-        run: npx vsce package --allow-missing-repository --allow-star-activation --out csx-vscode.vsix
+        run: npx vsce package --allow-missing-repository --allow-star-activation --out "csx-vscode-${{ needs.version.outputs.version }}.vsix"
 
       - name: Upload VSIX
         uses: actions/upload-artifact@v4
         with:
           name: csx-vscode-vsix
-          path: IDE/VsCode/csx-vscode.vsix
+          path: IDE/VsCode/csx-vscode-*.vsix
           if-no-files-found: error
 
   rider:
     name: Rider plugin (ZIP)
+    needs: version
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -72,6 +94,8 @@ jobs:
 
       - name: Build Rider plugin
         working-directory: IDE/Rider
+        env:
+          CSX_PLUGIN_VERSION: ${{ needs.version.outputs.version }}
         run: sh ./gradlew buildPlugin --no-daemon
 
       - name: Upload Rider plugin
@@ -80,3 +104,25 @@ jobs:
           name: csx-rider-plugin
           path: IDE/Rider/build/distributions/csx-rider-*.zip
           if-no-files-found: error
+
+  release:
+    name: Attach plugins to GitHub Release
+    if: github.ref_type == 'tag'
+    needs: [version, vsix, rider]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/csx-vscode-vsix/*.vsix
+            artifacts/csx-rider-plugin/*.zip
+          fail_on_unmatched_files: true
+          generate_release_notes: true

@@ -12,16 +12,32 @@ namespace CSX.Transformer
 
         public (string Text, SourceMap Map) TransformWithSourceMap(string source, TransformConfig? config = null)
         {
-            // Generated output always uses LF. Normalize first so source-map offsets stay aligned
-            // with the generated offsets; CRLF input otherwise shifts every mapping by one per line.
-            source = NormalizeLineEndings(source);
-            var tokens = Tokenizer.Tokenize(source);
-            return TransformWithSourceMap(source, tokens, config);
+            // Generated output always uses LF, so transform a normalized copy. The map's ORIGINAL
+            // offsets therefore refer to the LF-normalized source. LspProxy and LanguageServer
+            // normalize the source the same way before converting line/character <-> offset.
+            string normalized = NormalizeLineEndings(source);
+            var tokens = Tokenizer.Tokenize(normalized);
+            return TransformCore(normalized, tokens, config);
         }
 
         public (string Text, SourceMap Map) TransformWithSourceMap(string source, List<Token> tokens, TransformConfig? config = null)
         {
-            source = NormalizeLineEndings(source);
+            // Token positions are only valid for the exact text they were produced from. If the
+            // source contains CR characters we cannot safely normalize it underneath them, so
+            // re-tokenize via the normalizing overload instead.
+            if (source.IndexOf('\r') >= 0)
+                return TransformWithSourceMap(source, config);
+
+            return TransformCore(source, tokens, config);
+        }
+
+        public string Transform(string source, List<Token> tokens, TransformConfig? config = null)
+        {
+            return TransformWithSourceMap(source, tokens, config).Text;
+        }
+
+        private (string Text, SourceMap Map) TransformCore(string source, List<Token> tokens, TransformConfig? config)
+        {
             config ??= new TransformConfig();
             var sb = new StringBuilder();
             var map = new SourceMap { SourceFile = null, GeneratedFile = null };
@@ -35,21 +51,18 @@ namespace CSX.Transformer
                 if (t.StartPosition > pos)
                 {
                     string gap = source.Substring(pos, t.StartPosition - pos);
-                    int genStart = sb.Length;
+                    int gapStart = sb.Length;
                     sb.Append(gap);
-                    map.Add(genStart, gap.Length, pos, gap.Length);
+                    map.Add(gapStart, gap.Length, pos, gap.Length);
                 }
 
                 if (t.Kind == TokenKind.JsxOpenBracket)
                 {
                     int genStart = sb.Length;
-                    int origStart = t.StartPosition;
-                    string element = TransformElement(source, tokens, ref i, config, map, genStart, origStart);
+                    // TransformElement records all of its own mappings (including a fallback
+                    // for the whole element anchored to the '<').
+                    string element = TransformElement(source, tokens, ref i, config, map, genStart, t.StartPosition);
                     sb.Append(element);
-                    // The generated element is heavily rewritten. Anchor the whole element
-                    // mapping to the original '<' only; specific sub-mappings below handle
-                    // tag names and the framework marker.
-                    map.Add(genStart, element.Length, origStart, 1);
                     if (i > 0 && i - 1 < tokens.Count)
                     {
                         pos = tokens[i - 1].StartPosition + tokens[i - 1].Length;
@@ -68,19 +81,19 @@ namespace CSX.Transformer
             if (pos < source.Length)
             {
                 string tail = source.Substring(pos);
-                int genStart = sb.Length;
+                int tailStart = sb.Length;
                 sb.Append(tail);
-                map.Add(genStart, tail.Length, pos, tail.Length);
+                map.Add(tailStart, tail.Length, pos, tail.Length);
             }
 
             return (sb.ToString(), map);
         }
 
-        public string Transform(string source, List<Token> tokens, TransformConfig? config = null)
-        {
-            return TransformWithSourceMap(source, tokens, config).Text;
-        }
-
+        /// <summary>
+        /// Transforms one JSX element. <paramref name="genBase"/> is the ABSOLUTE offset in the
+        /// final generated text where the returned string will be placed (or, when called from a
+        /// helper that uses a temporary map, an offset relative to that map's own origin).
+        /// </summary>
         private static string TransformElement(string source, List<Token> tokens, ref int i, TransformConfig config, SourceMap? map = null, int genBase = 0, int origBase = 0)
         {
             int count = tokens.Count;
@@ -106,20 +119,22 @@ namespace CSX.Transformer
                     if (tokens[i].Kind == TokenKind.JsxText)
                     {
                         if (hasFragChild) fragResult.Append(", ");
-                        fragResult.Append(QuoteText(tokens[i].Text ?? ""));
+                        AppendText(fragResult, tokens[i], map, genBase);
                         i++;
                         hasFragChild = true;
                     }
                     else if (tokens[i].Kind == TokenKind.OpenBrace)
                     {
                         if (hasFragChild) fragResult.Append(", ");
-                        fragResult.Append(TransformBraced(source, tokens, ref i, config, map, genBase + fragResult.Length, tokens[i].StartPosition));
+                        int childGen = genBase + fragResult.Length;
+                        fragResult.Append(TransformBraced(source, tokens, ref i, config, map, childGen, tokens[i].StartPosition));
                         hasFragChild = true;
                     }
                     else if (tokens[i].Kind == TokenKind.JsxOpenBracket)
                     {
                         if (hasFragChild) fragResult.Append(", ");
-                        fragResult.Append(TransformElement(source, tokens, ref i, config, map, genBase + fragResult.Length, tokens[i].StartPosition));
+                        int childGen = genBase + fragResult.Length;
+                        fragResult.Append(TransformElement(source, tokens, ref i, config, map, childGen, tokens[i].StartPosition));
                         hasFragChild = true;
                     }
                     else
@@ -136,6 +151,7 @@ namespace CSX.Transformer
                 }
 
                 fragResult.Append(')');
+                AddElementFallback(map, genBase, fragResult.Length, origBase);
                 return fragResult.ToString();
             }
 
@@ -152,14 +168,17 @@ namespace CSX.Transformer
             else if (i < count && tokens[i].Kind == TokenKind.JsxTagName)
             {
                 tagName = tokens[i].Text ?? "";
+                origTagNameStart = tokens[i].StartPosition;
                 i++;
             }
 
             // consume generics
             string genericText = "";
+            int origGenericStart = -1;
             if (i < count && tokens[i].Kind == TokenKind.LessThan)
             {
-                int genStart = tokens[i].StartPosition;
+                int genericStart = tokens[i].StartPosition;
+                origGenericStart = genericStart;
                 int depth = 0;
                 while (i < count)
                 {
@@ -167,24 +186,46 @@ namespace CSX.Transformer
                     else if (tokens[i].Kind == TokenKind.GreaterThan) { depth--; i++; if (depth <= 0) break; }
                     else i++;
                 }
-                int genEnd = i > 0 ? tokens[i - 1].StartPosition + tokens[i - 1].Length : genStart;
-                genericText = source.Substring(genStart, genEnd - genStart).Trim();
+                int genericEnd = i > 0 ? tokens[i - 1].StartPosition + tokens[i - 1].Length : genericStart;
+                genericText = source.Substring(genericStart, genericEnd - genericStart).Trim();
             }
 
-            // attributes
-            var attrs = new List<string>();
+            // attributes. The joined attribute text is built here and its mappings are recorded
+            // relative to its own start; they are shifted into place once we know where it lands.
+            var attrBuilder = new StringBuilder();
+            var attrMap = map != null ? new SourceMap() : null;
+            int attrCount = 0;
             while (i < count && tokens[i].Kind != TokenKind.JsxCloseBracket && tokens[i].Kind != TokenKind.JsxSelfClose)
             {
                 if (tokens[i].Kind == TokenKind.JsxAttributeName)
                 {
-                    string name = tokens[i].Text ?? "";
+                    var nameToken = tokens[i];
+                    string name = nameToken.Text ?? "";
                     i++;
+                    bool hasValue = false;
                     if (i < count && tokens[i].Kind == TokenKind.Operator && tokens[i].Text == "=")
                     {
                         i++;
+                        hasValue = true;
                     }
-                    string value = ParseAttributeValue(source, tokens, ref i, config);
-                    attrs.Add(name + " = " + value);
+
+                    if (attrCount > 0) attrBuilder.Append(", ");
+                    attrMap?.Add(attrBuilder.Length, name.Length, nameToken.StartPosition, nameToken.Length);
+                    attrBuilder.Append(name).Append(" = ");
+                    if (hasValue)
+                    {
+                        string value = ParseAttributeValue(source, tokens, ref i, config, attrMap, attrBuilder.Length);
+                        attrBuilder.Append(value);
+                    }
+                    else
+                    {
+                        // Valueless attribute (e.g. <input disabled />) means true, as in JSX.
+                        // Anchor the generated `true` to the attribute name.
+                        const string boolValue = "true";
+                        attrMap?.Add(attrBuilder.Length, boolValue.Length, nameToken.StartPosition, nameToken.Length);
+                        attrBuilder.Append(boolValue);
+                    }
+                    attrCount++;
                 }
                 else
                 {
@@ -216,27 +257,32 @@ namespace CSX.Transformer
                 result.Append(cls).Append('.').Append(tagMethodUsed).Append('(').Append(Quote(tagName));
             }
 
+            // Offset of the tag name inside the generated prefix.
+            int genOffset = isComponent
+                ? cls.Length + 1 + tagMethodUsed.Length + 1
+                : cls.Length + 1 + tagMethodUsed.Length + 2;
+            bool hasTagMapping = origTagNameStart >= 0 && tagName.Length > 0;
+
             // Roslyn reports a missing framework class/method on the generated marker. Anchor
-            // that range to the original '<' so .cx shows the error exactly on the JSX bracket.
-            AddFrameworkMarkerMapping(map, genBase, origBase, result.Length);
-            if (map != null && origTagNameStart >= 0 && tagName.Length > 0)
+            // that range (up to, but not including, the tag name) to the original '<'.
+            AddFrameworkMarkerMapping(map, genBase, origBase, hasTagMapping ? genOffset : result.Length);
+            if (map != null && hasTagMapping)
             {
-                int genOffset = isComponent
-                    ? cls.Length + 1 + tagMethodUsed.Length + 1
-                    : cls.Length + 1 + tagMethodUsed.Length + 2;
                 map.Add(genBase + genOffset, tagName.Length, origTagNameStart, tagName.Length);
+                if (isComponent && genericText.Length > 0 && origGenericStart >= 0)
+                {
+                    map.Add(genBase + genOffset + tagName.Length, genericText.Length, origGenericStart, genericText.Length);
+                }
             }
 
-            if (attrs.Count > 0)
+            if (attrCount > 0)
             {
-                if (isComponent)
+                result.Append(isComponent ? "new() { " : ", new() { ");
+                if (map != null && attrMap != null)
                 {
-                    result.Append("new() { ").Append(string.Join(", ", attrs)).Append(" }");
+                    CopyMappings(attrMap, map, genBase + result.Length, 0, int.MaxValue);
                 }
-                else
-                {
-                    result.Append(", new() { ").Append(string.Join(", ", attrs)).Append(" }");
-                }
+                result.Append(attrBuilder).Append(" }");
             }
             else
             {
@@ -246,6 +292,7 @@ namespace CSX.Transformer
             if (selfClosing)
             {
                 result.Append(')');
+                AddElementFallback(map, genBase, result.Length, origBase);
                 return result.ToString();
             }
 
@@ -257,20 +304,22 @@ namespace CSX.Transformer
                 if (tokens[i].Kind == TokenKind.JsxText)
                 {
                     if (hasChild) result.Append(", ");
-                    result.Append(QuoteText(tokens[i].Text ?? ""));
+                    AppendText(result, tokens[i], map, genBase);
                     i++;
                     hasChild = true;
                 }
                 else if (tokens[i].Kind == TokenKind.OpenBrace)
                 {
                     if (hasChild) result.Append(", ");
-                    result.Append(TransformBraced(source, tokens, ref i, config, map, genBase + result.Length, tokens[i].StartPosition));
+                    int childGen = genBase + result.Length;
+                    result.Append(TransformBraced(source, tokens, ref i, config, map, childGen, tokens[i].StartPosition));
                     hasChild = true;
                 }
                 else if (tokens[i].Kind == TokenKind.JsxOpenBracket)
                 {
                     if (hasChild) result.Append(", ");
-                    result.Append(TransformElement(source, tokens, ref i, config, map, genBase + result.Length, tokens[i].StartPosition));
+                    int childGen = genBase + result.Length;
+                    result.Append(TransformElement(source, tokens, ref i, config, map, childGen, tokens[i].StartPosition));
                     hasChild = true;
                 }
                 else
@@ -288,6 +337,7 @@ namespace CSX.Transformer
             }
 
             result.Append(')');
+            AddElementFallback(map, genBase, result.Length, origBase);
             return result.ToString();
         }
 
@@ -297,29 +347,47 @@ namespace CSX.Transformer
             map.Add(genBase, prefixLength, origBase, 1);
         }
 
-        private static string ParseAttributeValue(string source, List<Token> tokens, ref int i, TransformConfig config)
+        // Added last for each element so the more specific mappings above/inside it come first.
+        private static void AddElementFallback(SourceMap? map, int genBase, int length, int origBase)
+        {
+            if (map == null || origBase < 0 || length <= 0) return;
+            map.Add(genBase, length, origBase, 1);
+        }
+
+        private static void AppendText(StringBuilder sb, Token token, SourceMap? map, int genBase)
+        {
+            string quoted = QuoteText(token.Text ?? "");
+            map?.Add(genBase + sb.Length, quoted.Length, token.StartPosition, token.Length);
+            sb.Append(quoted);
+        }
+
+        private static string ParseAttributeValue(string source, List<Token> tokens, ref int i, TransformConfig config, SourceMap? map = null, int genBase = 0)
         {
             int count = tokens.Count;
             if (i >= count) return "null";
 
             if (tokens[i].Kind == TokenKind.String)
             {
-                string v = tokens[i].Text ?? "";
+                var tok = tokens[i];
+                string v = tok.Text ?? "";
+                map?.Add(genBase, v.Length, tok.StartPosition, tok.Length);
                 i++;
                 return v;
             }
 
             if (tokens[i].Kind == TokenKind.OpenBrace)
             {
-                return TransformBraced(source, tokens, ref i, config);
+                return TransformBraced(source, tokens, ref i, config, map, genBase, tokens[i].StartPosition);
             }
 
             if (tokens[i].Kind == TokenKind.JsxOpenBracket)
             {
-                return TransformElement(source, tokens, ref i, config);
+                return TransformElement(source, tokens, ref i, config, map, genBase, tokens[i].StartPosition);
             }
 
-            string fallback = tokens[i].Text ?? "";
+            var fb = tokens[i];
+            string fallback = fb.Text ?? "";
+            map?.Add(genBase, fallback.Length, fb.StartPosition, fb.Length);
             i++;
             return fallback;
         }
@@ -330,6 +398,9 @@ namespace CSX.Transformer
             if (i >= count || tokens[i].Kind != TokenKind.OpenBrace) return "";
 
             var sb = new StringBuilder();
+            // Mappings are collected relative to the start of the raw (untrimmed) braced text,
+            // because the surrounding braces and whitespace are stripped afterwards.
+            var local = map != null ? new SourceMap() : null;
             int pos = tokens[i].StartPosition;
             int depth = 0;
 
@@ -338,47 +409,87 @@ namespace CSX.Transformer
                 var t = tokens[i];
                 if (t.StartPosition > pos)
                 {
-                    sb.Append(source.Substring(pos, t.StartPosition - pos));
+                    string gap = source.Substring(pos, t.StartPosition - pos);
+                    local?.Add(sb.Length, gap.Length, pos, gap.Length);
+                    sb.Append(gap);
                 }
 
-                if (t.Kind == TokenKind.OpenBrace)
+                if (t.Kind == TokenKind.JsxOpenBracket)
                 {
-                    depth++;
-                    sb.Append(t.Text);
-                    pos = t.StartPosition + t.Length;
-                    i++;
-                }
-                else if (t.Kind == TokenKind.CloseBrace)
-                {
-                    depth--;
-                    sb.Append(t.Text);
-                    pos = t.StartPosition + t.Length;
-                    i++;
-                    if (depth <= 0) break;
-                }
-                else if (t.Kind == TokenKind.JsxOpenBracket)
-                {
-                    string elem = TransformElement(source, tokens, ref i, config, map, genBase + sb.Length, t.StartPosition);
+                    string elem = TransformElement(source, tokens, ref i, config, local, sb.Length, t.StartPosition);
                     sb.Append(elem);
                     if (i > 0 && i - 1 < tokens.Count)
                     {
                         pos = tokens[i - 1].StartPosition + tokens[i - 1].Length;
                     }
+                    continue;
                 }
-                else
+
+                local?.Add(sb.Length, (t.Text ?? "").Length, t.StartPosition, t.Length);
+                sb.Append(t.Text);
+                pos = t.StartPosition + t.Length;
+                i++;
+
+                if (t.Kind == TokenKind.OpenBrace)
                 {
-                    sb.Append(t.Text);
-                    pos = t.StartPosition + t.Length;
-                    i++;
+                    depth++;
+                }
+                else if (t.Kind == TokenKind.CloseBrace)
+                {
+                    depth--;
+                    if (depth <= 0) break;
                 }
             }
 
-            var result = sb.ToString().Trim();
-            if (result.StartsWith("{") && result.EndsWith("}"))
+            // Trim whitespace, strip the outer { }, trim again, tracking exactly how much was
+            // removed from the front so nested mappings can be shifted by the same amount.
+            string raw = sb.ToString();
+            int start = 0;
+            int end = raw.Length;
+            while (start < end && char.IsWhiteSpace(raw[start])) start++;
+            while (end > start && char.IsWhiteSpace(raw[end - 1])) end--;
+            if (end - start >= 2 && raw[start] == '{' && raw[end - 1] == '}')
             {
-                result = result.Substring(1, result.Length - 2).Trim();
+                start++;
+                end--;
+                while (start < end && char.IsWhiteSpace(raw[start])) start++;
+                while (end > start && char.IsWhiteSpace(raw[end - 1])) end--;
             }
-            return result;
+
+            if (map != null && local != null)
+            {
+                CopyMappings(local, map, genBase - start, start, end);
+            }
+
+            return raw.Substring(start, end - start);
+        }
+
+        /// <summary>
+        /// Copies mappings from <paramref name="from"/> into <paramref name="to"/>, adding
+        /// <paramref name="shift"/> to the generated offsets and clipping the generated range to
+        /// [<paramref name="lo"/>, <paramref name="hi"/>) (pre-shift coordinates).
+        /// </summary>
+        private static void CopyMappings(SourceMap from, SourceMap to, int shift, int lo, int hi)
+        {
+            foreach (var e in from.Mappings)
+            {
+                int gs = e.GeneratedStart;
+                int ge = gs + e.GeneratedLength;
+                int ns = Math.Max(gs, lo);
+                int ne = Math.Min(ge, hi);
+                if (ne <= ns) continue;
+
+                int os = e.OriginalStart;
+                int ol = e.OriginalLength;
+                if (e.GeneratedLength == e.OriginalLength)
+                {
+                    // 1:1 text, so clipping the generated side clips the original side equally.
+                    os += ns - gs;
+                    ol = ne - ns;
+                }
+
+                to.Add(ns + shift, ne - ns, os, ol);
+            }
         }
 
         private static string Quote(string value)

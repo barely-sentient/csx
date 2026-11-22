@@ -17,7 +17,9 @@ namespace CSX.Transformer
 
         public string? GeneratedFile { get; set; }
 
-        public List<SourceMapEntry> Mappings { get; } = new List<SourceMapEntry>();
+        // Needs a setter: System.Text.Json ignores get-only collection properties when
+        // deserializing, which left every map loaded by SourceMapResolver empty.
+        public List<SourceMapEntry> Mappings { get; set; } = new List<SourceMapEntry>();
 
         public void Add(int generatedStart, int generatedLength, int originalStart, int originalLength)
         {

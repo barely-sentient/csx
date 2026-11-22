@@ -84,7 +84,12 @@ public class UserDashboard
         };
 
         var message = $"Found {users.Count} active users";
-
+        
+        if (message.StartsWith("Found"))
+        {
+            message = message.Replace("Found", "Located");
+        }
+        
         // JSX STARTS HERE
         return 
         <div className="dashboard">

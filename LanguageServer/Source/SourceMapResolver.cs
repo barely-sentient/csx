@@ -76,6 +76,18 @@ namespace CSX.LanguageServer
                     return m.GeneratedStart + (originalOffset - m.OriginalStart);
                 }
             }
+
+            // Nothing starts at this offset (e.g. the caret is directly after the last token of
+            // a tag, before an unmapped '>', or at end of file). Use the end of the preserved
+            // entry that finishes exactly here, so completion/hover land on the text just typed.
+            foreach (var m in map.Mappings)
+            {
+                if (m.GeneratedLength == m.OriginalLength &&
+                    m.OriginalStart + m.OriginalLength == originalOffset)
+                {
+                    return m.GeneratedStart + m.GeneratedLength;
+                }
+            }
             return originalOffset;
         }
     }
