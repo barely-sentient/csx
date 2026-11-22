@@ -15,6 +15,8 @@ namespace CSX.LanguageServer
         private readonly Dictionary<string, string> _generatedToOriginal = new(StringComparer.OrdinalIgnoreCase);
     private readonly System.Collections.Concurrent.ConcurrentDictionary<int, byte> _injectedIds = new();
     private int _nextInjectedId = 1000000;
+    private System.Threading.Tasks.TaskCompletionSource<bool>? _projectReady;
+    private readonly Dictionary<int, string> _requestUris = new();
 
         public LspProxy(LanguageServerOptions options, SourceMapResolver resolver)
         {
@@ -24,6 +26,128 @@ namespace CSX.LanguageServer
 
         public async Task RunAsync(Stream clientIn, Stream clientOut, Stream backendIn, Stream backendOut, CancellationToken ct)
         {
+            _projectReady = new System.Threading.Tasks.TaskCompletionSource<bool>(System.Threading.Tasks.TaskCreationOptions.RunContinuationsAsynchronously);
+
+            // Synchronous handshake: load the project before the client sends didOpen,
+            // so documents associate with the project instead of a misc file-based program.
+            try
+            {
+                Console.Error.WriteLine("handshake: waiting for init");
+                var initDoc = await ReadMessageAsync(clientIn, ct).ConfigureAwait(false);
+                Console.Error.WriteLine("handshake: got init");
+                if (initDoc != null)
+                {
+                    var rewrittenInit = RewriteMessage(initDoc, true);
+                    await WriteMessageAsync(backendIn, rewrittenInit, ct).ConfigureAwait(false);
+
+                    // Wait for initialize response.
+                    JsonDocument? initResp = null;
+                    string? initIdRaw = initDoc.RootElement.TryGetProperty("id", out var iid) ? iid.GetRawText() : null;
+
+                    var deadline = DateTime.UtcNow.AddSeconds(10);
+                    while (initResp == null && DateTime.UtcNow < deadline && !ct.IsCancellationRequested)
+                    {
+                        using var tcts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                        tcts.CancelAfter(TimeSpan.FromSeconds(3));
+                        JsonDocument? msg = null;
+                        try { msg = await ReadMessageAsync(backendOut, tcts.Token).ConfigureAwait(false); }
+                        catch (OperationCanceledException) { msg = null; }
+                        if (msg == null) break;
+                        if (initIdRaw != null && msg.RootElement.TryGetProperty("id", out var rid) &&
+                            rid.GetRawText() == initIdRaw &&
+                            !msg.RootElement.TryGetProperty("method", out _))
+                        {
+                            initResp = msg;
+                            Console.Error.WriteLine("handshake: got init response");
+                        }
+                        else
+                        {
+                            // Don't forward unsolicited messages to client before init response.
+                            // Respond to server->client requests directly so backend doesn't block.
+                            if (msg.RootElement.TryGetProperty("method", out var m) && msg.RootElement.TryGetProperty("id", out var rid2))
+                            {
+                                var method = m.GetString();
+                                JsonDocument? resp = null;
+                                if (method == "workspace/configuration")
+                                {
+                                    int cnt = 1;
+                                    if (msg.RootElement.TryGetProperty("params", out var p) && p.TryGetProperty("items", out var items) && items.ValueKind == JsonValueKind.Array)
+                                        cnt = items.GetArrayLength();
+                                    resp = JsonDocument.Parse("{\"jsonrpc\":\"2.0\",\"id\":" + rid2.GetRawText() + ",\"result\":[" + string.Join(",", Enumerable.Repeat("null", cnt)) + "]}");
+                                }
+                                else if (method == "workspace/workspaceFolders")
+                                {
+                                    resp = JsonDocument.Parse("{\"jsonrpc\":\"2.0\",\"id\":" + rid2.GetRawText() + ",\"result\":[]}");
+                                }
+                                if (resp != null) await WriteMessageAsync(backendIn, resp, ct).ConfigureAwait(false);
+                            }
+                            // discard logs/notifications during handshake
+                        }
+                    }
+
+                    Console.Error.WriteLine("handshake: sending project/open");
+                    if (!string.IsNullOrWhiteSpace(_options.GeneratedProjectPath) && File.Exists(_options.GeneratedProjectPath))
+                    {
+                        var projectUri = new Uri(_options.GeneratedProjectPath).AbsoluteUri;
+                        var openProject = JsonDocument.Parse(
+                            "{\"jsonrpc\":\"2.0\",\"method\":\"project/open\",\"params\":{\"projects\":[\"" + projectUri + "\"]}}");
+                        await WriteMessageAsync(backendIn, openProject, ct).ConfigureAwait(false);
+
+                        // Wait for projectInitializationComplete
+                        var pdeadline = DateTime.UtcNow.AddSeconds(5);
+                        while (DateTime.UtcNow < pdeadline && !ct.IsCancellationRequested)
+                        {
+                            using var tcts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                            tcts.CancelAfter(TimeSpan.FromSeconds(2));
+                            JsonDocument? msg = null;
+                            try { msg = await ReadMessageAsync(backendOut, tcts.Token).ConfigureAwait(false); }
+                            catch (OperationCanceledException) { msg = null; }
+                            if (msg == null) break;
+                            if (msg.RootElement.TryGetProperty("method", out var pm) && pm.GetString() == "workspace/projectInitializationComplete")
+                            {
+                                _projectReady?.TrySetResult(true);
+                                break;
+                            }
+                            // Respond to server->client requests; discard the rest.
+                            if (msg.RootElement.TryGetProperty("method", out var m2) && msg.RootElement.TryGetProperty("id", out var rid2))
+                            {
+                                var method = m2.GetString();
+                                JsonDocument? resp = null;
+                                if (method == "workspace/configuration")
+                                {
+                                    int cnt = 1;
+                                    if (msg.RootElement.TryGetProperty("params", out var p) && p.TryGetProperty("items", out var items) && items.ValueKind == JsonValueKind.Array)
+                                        cnt = items.GetArrayLength();
+                                    resp = JsonDocument.Parse("{\"jsonrpc\":\"2.0\",\"id\":" + rid2.GetRawText() + ",\"result\":[" + string.Join(",", Enumerable.Repeat("null", cnt)) + "]}");
+                                }
+                                else if (method == "workspace/workspaceFolders")
+                                {
+                                    resp = JsonDocument.Parse("{\"jsonrpc\":\"2.0\",\"id\":" + rid2.GetRawText() + ",\"result\":[]}");
+                                }
+                                if (resp != null) await WriteMessageAsync(backendIn, resp, ct).ConfigureAwait(false);
+                            }
+                        }
+                    }
+
+                    Console.Error.WriteLine("handshake: sending init response to client");
+                    if (initResp != null)
+                    {
+                        var rewrittenResp = RewriteMessage(initResp, false);
+                        await WriteMessageAsync(clientOut, rewrittenResp, ct).ConfigureAwait(false);
+                        Console.Error.WriteLine("handshake: init response sent");
+                    }
+                    else
+                    {
+                        Console.Error.WriteLine("handshake: initResp is null, NOT sending response");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine("csx: handshake failed: " + ex.Message);
+            }
+
+            // Normal pumps for the rest.
             var c2s = PumpAsync(clientIn, backendIn, true, ct);
             var s2c = PumpAsync(backendOut, clientOut, false, ct);
             await Task.WhenAny(c2s, s2c).ConfigureAwait(false);
@@ -46,8 +170,16 @@ namespace CSX.LanguageServer
                     continue;
                 }
 
+                // Track project readiness.
+                if (!clientToServer && doc.RootElement.TryGetProperty("method", out var mth) &&
+                    mth.GetString() == "workspace/projectInitializationComplete")
+                {
+                    _projectReady?.TrySetResult(true);
+                }
+
                 try
                 {
+                    Console.Error.WriteLine("proxy: " + (clientToServer ? "C->S" : "S->C") + " " + (doc.RootElement.TryGetProperty("method", out var _mm) ? _mm.GetString() : "response id=" + (doc.RootElement.TryGetProperty("id", out var _ii) ? _ii.GetRawText() : "?")) + " | " + doc.RootElement.GetRawText().Substring(0, Math.Min(120, doc.RootElement.GetRawText().Length)));
                     var rewritten = RewriteMessage(doc, clientToServer);
                     await WriteMessageAsync(output, rewritten, ct).ConfigureAwait(false);
 
@@ -64,26 +196,11 @@ namespace CSX.LanguageServer
                         await WriteMessageAsync(output, openProject, ct).ConfigureAwait(false);
                     }
 
-                    // Warm up newly opened documents so cross-file member completion works.
-                    if (clientToServer && rewritten.RootElement.TryGetProperty("method", out var m2) &&
-                        m2.GetString() == "textDocument/didOpen" &&
-                        rewritten.RootElement.TryGetProperty("params", out var pp) &&
-                        pp.TryGetProperty("textDocument", out var tdoc) &&
-                        tdoc.TryGetProperty("uri", out var uriNode))
-                    {
-                        var openedUri = uriNode.GetString();
-                        if (!string.IsNullOrEmpty(openedUri))
-                        {
-                            int injectedId = Interlocked.Increment(ref _nextInjectedId);
-                            _injectedIds.TryAdd(injectedId, 0);
-                            var warmup = JsonDocument.Parse(
-                                "{\"jsonrpc\":\"2.0\",\"id\":" + injectedId + ",\"method\":\"textDocument/hover\",\"params\":{\"textDocument\":{\"uri\":\"" + openedUri + "\"},\"position\":{\"line\":0,\"character\":0}}}");
-                            await WriteMessageAsync(output, warmup, ct).ConfigureAwait(false);
-                        }
-                    }
+                    // (warm-up hover removed: project is loaded before didOpen now)
                 }
-                catch
+                catch (Exception ex)
                 {
+                    Console.Error.WriteLine("proxy: RewriteMessage failed: " + ex.Message);
                     await WriteMessageAsync(output, doc, ct).ConfigureAwait(false);
                 }
             }
@@ -94,15 +211,15 @@ namespace CSX.LanguageServer
             // Read headers
             var headerBytes = new List<byte>();
             int prev = -1;
+            var oneByte = new byte[1];
             while (true)
             {
-                int b = stream.ReadByte();
-                if (b == -1) return null;
+                int r = await stream.ReadAsync(oneByte, 0, 1, ct).ConfigureAwait(false);
+                if (r == 0) return null;
+                int b = oneByte[0];
                 headerBytes.Add((byte)b);
                 if (prev == '\r' && b == '\n')
                 {
-                    // check if next is \r\n (end of headers)
-                    // peek by reading two more? Instead, check headerBytes ends with \r\n\r\n
                     if (headerBytes.Count >= 4 &&
                         headerBytes[headerBytes.Count - 4] == '\r' &&
                         headerBytes[headerBytes.Count - 3] == '\n' &&
@@ -181,6 +298,17 @@ namespace CSX.LanguageServer
                 catch { }
             }
 
+            // Log hover/completion for debugging
+            try
+            {
+                var method = node["method"]?.GetValue<string>();
+                if (method == "textDocument/hover" || method == "textDocument/completion")
+                {
+                    Console.Error.WriteLine("proxy: " + (clientToServer ? "C->S" : "S->C") + " " + method);
+                }
+            }
+            catch { }
+
             // Ensure generated files exist for any uri encountered
             RewriteNode(node, clientToServer, null);
 
@@ -193,8 +321,10 @@ namespace CSX.LanguageServer
             if (node is JsonObject obj)
             {
                 string? uri = currentUri;
+                string? originalUriForTracking = null;
                 if (obj.TryGetPropertyValue("uri", out var uriNode) && uriNode is JsonValue uv && uv.TryGetValue<string>(out var us))
                 {
+                    originalUriForTracking = us;
                     if (clientToServer)
                     {
                         uri = GetGeneratedUri(us);
@@ -211,6 +341,27 @@ namespace CSX.LanguageServer
                     // Resolve uri from nested textDocument even if it appears later in traversal.
                     if (clientToServer) uri = GetGeneratedUri(tus);
                     else uri = GetOriginalUri(tus);
+                }
+                else if (!clientToServer && obj.TryGetPropertyValue("id", out var idNode) && idNode is JsonValue idv &&
+                         idv.TryGetValue<int>(out var idInt) && !obj.ContainsKey("method"))
+                {
+                    // Response to a previous client request: resolve uri from tracked request.
+                    if (_requestUris.TryGetValue(idInt, out var origUri))
+                    {
+                        uri = origUri;
+                    }
+                }
+
+                // Track request uris for response mapping.
+                if (clientToServer && obj.TryGetPropertyValue("id", out var ridNode) && ridNode is JsonValue ridv &&
+                    ridv.TryGetValue<int>(out var ridInt) && obj.TryGetPropertyValue("method", out _))
+                {
+                    // find uri in this request (may be nested under params.textDocument)
+                    string? reqUri = originalUriForTracking;
+                    if (reqUri == null && obj.TryGetPropertyValue("params", out var rparams) && rparams is JsonObject rpo &&
+                        rpo.TryGetPropertyValue("textDocument", out var rtd) && rtd is JsonObject rtdo &&
+                        rtdo.TryGetPropertyValue("uri", out var rtdu) && rtdu is JsonValue rtuv && rtuv.TryGetValue<string>(out var rtus)) reqUri = rtus;
+                    if (reqUri != null) _requestUris[ridInt] = reqUri;
                 }
 
                 // didOpen: replace text with generated content
@@ -327,9 +478,10 @@ namespace CSX.LanguageServer
         // Helpers for URI mapping
         private void ConvertPosition(JsonObject pos, bool clientToServer, string? uri)
         {
-            if (uri == null) return;
+            if (uri == null) { Console.Error.WriteLine("ConvertPosition: uri null"); return; }
             if (!int.TryParse(pos["line"]?.ToString(), out var line)) return;
             if (!int.TryParse(pos["character"]?.ToString(), out var ch)) return;
+            Console.Error.WriteLine($"ConvertPosition: {(clientToServer ? "C->S" : "S->C")} uri={uri} line={line} ch={ch}");
 
             string generatedPath;
             string originalPath;
@@ -447,7 +599,20 @@ namespace CSX.LanguageServer
 
         private static string UriToPath(string uri)
         {
-            try { return new Uri(uri).LocalPath; } catch { return uri; }
+            try
+            {
+                // VS Code may send the drive-letter colon percent-encoded (%3A).
+                var unescaped = Uri.UnescapeDataString(uri);
+                var path = new Uri(unescaped).LocalPath;
+                // Normalize forward slashes and strip a leading slash before a drive letter.
+                path = path.Replace('/', '\\');
+                if (path.Length >= 3 && path[0] == '\\' && char.IsLetter(path[1]) && path[2] == ':')
+                {
+                    path = path.Substring(1);
+                }
+                return path;
+            }
+            catch { return uri; }
         }
 
         private static string PathToUri(string path)

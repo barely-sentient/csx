@@ -1,26 +1,20 @@
 {
-  "comments": {
-    "lineComment": "//",
-    "blockComment": ["/*", "*/"]
-  },
-  "brackets": [
-    ["{", "}"],
-    ["[", "]"],
-    ["(", ")"],
-    ["<", ">"]
-  ],
+  "comments": { "lineComment": "//", "blockComment": ["/*", "*/"] },
+  "brackets": [["{", "}"], ["[", "]"], ["(", ")"], ["<", ">"]],
   "autoClosingPairs": [
     { "open": "{", "close": "}" },
     { "open": "[", "close": "]" },
     { "open": "(", "close": ")" },
-    { "open": "<", "close": ">" },
-    { "open": "\"", "close": "\"", "notIn": ["string"] }
+    { "open": "\"", "close": "\"", "notIn": ["string", "comment"] },
+    { "open": "'", "close": "'", "notIn": ["string", "comment"] },
+    { "open": "/*", "close": " */", "notIn": ["string"] }
   ],
-  "surroundingPairs": [
-    ["{", "}"],
-    ["[", "]"],
-    ["(", ")"],
-    ["<", ">"],
-    ["\"", "\""]
+  "surroundingPairs": [["{", "}"], ["[", "]"], ["(", ")"], ["\"", "\""], ["'", "'"], ["<", ">"]],
+  "onEnterRules": [
+    {
+      "beforeText": "<([A-Za-z][\\w.:-]*)(?:<[^>]*>)?(?:\\s[^>]*)?>\\s*$",
+      "afterText": "^\\s*</[A-Za-z][\\w.:-]*>",
+      "action": { "indent": "indentOutdent" }
+    }
   ]
 }
