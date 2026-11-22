@@ -12,6 +12,10 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CSX.Transformer.Tests", "Tr
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Debug", "Transformer\Debug\Debug.csproj", "{CA1CCE17-BCD3-445A-947E-C194F9980F30}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CSX.LanguageServer", "LanguageServer\Source\CSX.LanguageServer.csproj", "{AD757CEE-EA17-4D67-AA5D-5C92C6057ACD}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CSX.CliTool", "CliTool\Source\CSX.CliTool.csproj", "{806BFE8A-E65F-46BD-BD2B-27D7E1921D49}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -42,5 +46,13 @@ Global
 		{CA1CCE17-BCD3-445A-947E-C194F9980F30}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{CA1CCE17-BCD3-445A-947E-C194F9980F30}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{CA1CCE17-BCD3-445A-947E-C194F9980F30}.Release|Any CPU.Build.0 = Release|Any CPU
+		{AD757CEE-EA17-4D67-AA5D-5C92C6057ACD}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{AD757CEE-EA17-4D67-AA5D-5C92C6057ACD}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{AD757CEE-EA17-4D67-AA5D-5C92C6057ACD}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{AD757CEE-EA17-4D67-AA5D-5C92C6057ACD}.Release|Any CPU.Build.0 = Release|Any CPU
+		{806BFE8A-E65F-46BD-BD2B-27D7E1921D49}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{806BFE8A-E65F-46BD-BD2B-27D7E1921D49}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{806BFE8A-E65F-46BD-BD2B-27D7E1921D49}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{806BFE8A-E65F-46BD-BD2B-27D7E1921D49}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 EndGlobal

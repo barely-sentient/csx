@@ -9,5 +9,7 @@
         public string FrameworkComponentMethod { get; set; } = "C";
         
         public string FrameworkFragmentMethod { get; set; } = "F";
+
+        public string GeneratedFileOutput { get; set; } = "src/generated";
     }
 }

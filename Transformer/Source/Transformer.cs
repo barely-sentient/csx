@@ -7,15 +7,20 @@ namespace CSX.Transformer
     {
         public string Transform(string source, TransformConfig? config = null)
         {
-            config ??= new TransformConfig();
-            var tokens = Tokenizer.Tokenize(source);
-            return Transform(source, tokens, config);
+            return TransformWithSourceMap(source, Tokenizer.Tokenize(source), config).Text;
         }
 
-        public string Transform(string source, List<Token> tokens, TransformConfig? config = null)
+        public (string Text, SourceMap Map) TransformWithSourceMap(string source, TransformConfig? config = null)
+        {
+            var tokens = Tokenizer.Tokenize(source);
+            return TransformWithSourceMap(source, tokens, config);
+        }
+
+        public (string Text, SourceMap Map) TransformWithSourceMap(string source, List<Token> tokens, TransformConfig? config = null)
         {
             config ??= new TransformConfig();
             var sb = new StringBuilder();
+            var map = new SourceMap { SourceFile = null, GeneratedFile = null };
             int i = 0;
             int pos = 0;
             int count = tokens.Count;
@@ -25,13 +30,20 @@ namespace CSX.Transformer
                 var t = tokens[i];
                 if (t.StartPosition > pos)
                 {
-                    sb.Append(source.Substring(pos, t.StartPosition - pos));
+                    string gap = source.Substring(pos, t.StartPosition - pos);
+                    int genStart = sb.Length;
+                    sb.Append(gap);
+                    map.Add(genStart, gap.Length, pos, gap.Length);
                 }
 
                 if (t.Kind == TokenKind.JsxOpenBracket)
                 {
+                    int genStart = sb.Length;
+                    int origStart = t.StartPosition;
                     string element = TransformElement(source, tokens, ref i, config);
                     sb.Append(element);
+                    int origEnd = i > 0 ? tokens[i - 1].StartPosition + tokens[i - 1].Length : origStart;
+                    map.Add(genStart, element.Length, origStart, origEnd - origStart);
                     if (i > 0 && i - 1 < tokens.Count)
                     {
                         pos = tokens[i - 1].StartPosition + tokens[i - 1].Length;
@@ -39,7 +51,9 @@ namespace CSX.Transformer
                 }
                 else
                 {
+                    int genStart = sb.Length;
                     sb.Append(t.Text);
+                    map.Add(genStart, (t.Text ?? "").Length, t.StartPosition, t.Length);
                     pos = t.StartPosition + t.Length;
                     i++;
                 }
@@ -47,10 +61,18 @@ namespace CSX.Transformer
 
             if (pos < source.Length)
             {
-                sb.Append(source.Substring(pos));
+                string tail = source.Substring(pos);
+                int genStart = sb.Length;
+                sb.Append(tail);
+                map.Add(genStart, tail.Length, pos, tail.Length);
             }
 
-            return sb.ToString();
+            return (sb.ToString(), map);
+        }
+
+        public string Transform(string source, List<Token> tokens, TransformConfig? config = null)
+        {
+            return TransformWithSourceMap(source, tokens, config).Text;
         }
 
         private static string TransformElement(string source, List<Token> tokens, ref int i, TransformConfig config)
