@@ -1,0 +1,28 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CSX.Parser", "Parser\Source\CSX.Parser.csproj", "{BF8B3FF5-61B4-4461-B0A8-E4CE70BA1220}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CSX.Parser.Tests", "Parser\Tests\CSX.Parser.Tests.csproj", "{C223E575-EE63-4229-90B2-72C593C7E386}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Debug", "Parser\Debug\Debug.csproj", "{FE6838A3-6453-4F1F-B8BC-AF018C2D5358}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{BF8B3FF5-61B4-4461-B0A8-E4CE70BA1220}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{BF8B3FF5-61B4-4461-B0A8-E4CE70BA1220}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{BF8B3FF5-61B4-4461-B0A8-E4CE70BA1220}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{BF8B3FF5-61B4-4461-B0A8-E4CE70BA1220}.Release|Any CPU.Build.0 = Release|Any CPU
+		{C223E575-EE63-4229-90B2-72C593C7E386}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{C223E575-EE63-4229-90B2-72C593C7E386}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{C223E575-EE63-4229-90B2-72C593C7E386}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{C223E575-EE63-4229-90B2-72C593C7E386}.Release|Any CPU.Build.0 = Release|Any CPU
+		{FE6838A3-6453-4F1F-B8BC-AF018C2D5358}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{FE6838A3-6453-4F1F-B8BC-AF018C2D5358}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{FE6838A3-6453-4F1F-B8BC-AF018C2D5358}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{FE6838A3-6453-4F1F-B8BC-AF018C2D5358}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal
