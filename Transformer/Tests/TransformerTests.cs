@@ -79,10 +79,22 @@ public class TransformerTests
     [Fact]
     public void SampleTransforms()
     {
-        var source = File.ReadAllText(@"C:\Users\jhuds\Desktop\UI Framework\CSharpExtended\samples\full-class.cx");
+        var source = File.ReadAllText(FindSample());
         var result = new Transformer().Transform(source);
         Assert.Contains("_.H(\"div\"", result);
         Assert.Contains("_.C<UserCard<User>, UserCardProps>", result);
         Assert.DoesNotContain("<div", result);
+    }
+
+    private static string FindSample()
+    {
+        var dir = new DirectoryInfo(AppContext.BaseDirectory);
+        while (dir != null)
+        {
+            var candidate = Path.Combine(dir.FullName, "samples", "full-class.cx");
+            if (File.Exists(candidate)) return candidate;
+            dir = dir.Parent;
+        }
+        return Path.Combine(Directory.GetCurrentDirectory(), "samples", "full-class.cx");
     }
 }

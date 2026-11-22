@@ -110,7 +110,7 @@ public class TokenizerTests
     [Fact]
     public void SampleTokenizesWithoutUnknown()
     {
-        var src = File.ReadAllText(@"C:\Users\jhuds\Desktop\UI Framework\CSharpExtended\samples\full-class.cx");
+        var src = File.ReadAllText(FindSample());
         var tokens = Tokenizer.Tokenize(src);
         Assert.DoesNotContain(tokens, t => t.Kind == TokenKind.Unknown);
         Assert.NotEmpty(tokens);
@@ -119,7 +119,7 @@ public class TokenizerTests
     [Fact]
     public void SampleHasJsxBrackets()
     {
-        var src = File.ReadAllText(@"C:\Users\jhuds\Desktop\UI Framework\CSharpExtended\samples\full-class.cx");
+        var src = File.ReadAllText(FindSample());
         var tokens = Tokenizer.Tokenize(src);
         Assert.True(tokens.Count(t => t.Kind == TokenKind.JsxOpenBracket) >= 10);
         Assert.True(tokens.Count(t => t.Kind == TokenKind.JsxSelfClose) >= 2);
@@ -156,5 +156,17 @@ public class TokenizerTests
         var t = tokens.First(x => x.Kind == TokenKind.JsxComponentName);
         Assert.True(t.IsComponent);
         Assert.Equal("Loop", t.TagName);
+    }
+
+    private static string FindSample()
+    {
+        var dir = new DirectoryInfo(AppContext.BaseDirectory);
+        while (dir != null)
+        {
+            var candidate = Path.Combine(dir.FullName, "samples", "full-class.cx");
+            if (File.Exists(candidate)) return candidate;
+            dir = dir.Parent;
+        }
+        return Path.Combine(Directory.GetCurrentDirectory(), "samples", "full-class.cx");
     }
 }
