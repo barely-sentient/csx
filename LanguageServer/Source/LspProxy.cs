@@ -13,6 +13,8 @@ namespace CSX.LanguageServer
 
         private readonly Dictionary<string, string> _originalToGenerated = new(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, string> _generatedToOriginal = new(StringComparer.OrdinalIgnoreCase);
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<int, byte> _injectedIds = new();
+    private int _nextInjectedId = 1000000;
 
         public LspProxy(LanguageServerOptions options, SourceMapResolver resolver)
         {
@@ -34,10 +36,51 @@ namespace CSX.LanguageServer
                 var doc = await ReadMessageAsync(input, ct).ConfigureAwait(false);
                 if (doc == null) break;
 
+                // Drop responses to injected warm-up requests so they don't reach the client.
+                if (!clientToServer &&
+                    !doc.RootElement.TryGetProperty("method", out _) &&
+                    doc.RootElement.TryGetProperty("id", out var rid) &&
+                    rid.ValueKind == JsonValueKind.Number &&
+                    _injectedIds.TryRemove(rid.GetInt32(), out _))
+                {
+                    continue;
+                }
+
                 try
                 {
                     var rewritten = RewriteMessage(doc, clientToServer);
                     await WriteMessageAsync(output, rewritten, ct).ConfigureAwait(false);
+
+                    // After the client signals initialized, open the generated project
+                    // in the C# backend so it provides full IntelliSense.
+                    if (clientToServer && rewritten.RootElement.TryGetProperty("method", out var m) &&
+                        m.GetString() == "initialized" &&
+                        !string.IsNullOrWhiteSpace(_options.GeneratedProjectPath) &&
+                        File.Exists(_options.GeneratedProjectPath))
+                    {
+                        var projectUri = new Uri(_options.GeneratedProjectPath).AbsoluteUri;
+                        var openProject = JsonDocument.Parse(
+                            "{\"jsonrpc\":\"2.0\",\"method\":\"project/open\",\"params\":{\"projects\":[\"" + projectUri + "\"]}}");
+                        await WriteMessageAsync(output, openProject, ct).ConfigureAwait(false);
+                    }
+
+                    // Warm up newly opened documents so cross-file member completion works.
+                    if (clientToServer && rewritten.RootElement.TryGetProperty("method", out var m2) &&
+                        m2.GetString() == "textDocument/didOpen" &&
+                        rewritten.RootElement.TryGetProperty("params", out var pp) &&
+                        pp.TryGetProperty("textDocument", out var tdoc) &&
+                        tdoc.TryGetProperty("uri", out var uriNode))
+                    {
+                        var openedUri = uriNode.GetString();
+                        if (!string.IsNullOrEmpty(openedUri))
+                        {
+                            int injectedId = Interlocked.Increment(ref _nextInjectedId);
+                            _injectedIds.TryAdd(injectedId, 0);
+                            var warmup = JsonDocument.Parse(
+                                "{\"jsonrpc\":\"2.0\",\"id\":" + injectedId + ",\"method\":\"textDocument/hover\",\"params\":{\"textDocument\":{\"uri\":\"" + openedUri + "\"},\"position\":{\"line\":0,\"character\":0}}}");
+                            await WriteMessageAsync(output, warmup, ct).ConfigureAwait(false);
+                        }
+                    }
                 }
                 catch
                 {
@@ -46,7 +89,7 @@ namespace CSX.LanguageServer
             }
         }
 
-        private static async Task<JsonDocument?> ReadMessageAsync(Stream stream, CancellationToken ct)
+        public static async Task<JsonDocument?> ReadMessageAsync(Stream stream, CancellationToken ct)
         {
             // Read headers
             var headerBytes = new List<byte>();
@@ -112,6 +155,32 @@ namespace CSX.LanguageServer
             var node = JsonNode.Parse(doc.RootElement.GetRawText());
             if (node == null) return doc;
 
+            // Force full-document sync so the proxy can transform whole documents
+            // instead of having to replay incremental edits.
+            if (!clientToServer)
+            {
+                try
+                {
+                    var caps = node["result"]?["capabilities"] as JsonObject;
+                    if (caps != null)
+                    {
+                        var sync = caps["textDocumentSync"];
+                        if (sync is JsonObject so)
+                        {
+                            so["change"] = 1;
+                            so["openClose"] = true;
+                        }
+                        else if (sync != null)
+                        {
+                            caps["textDocumentSync"] = 1;
+                        }
+                        caps.Remove("semanticTokensProvider");
+                        caps["inlayHintProvider"] = false;
+                    }
+                }
+                catch { }
+            }
+
             // Ensure generated files exist for any uri encountered
             RewriteNode(node, clientToServer, null);
 
@@ -136,6 +205,13 @@ namespace CSX.LanguageServer
                     }
                     obj["uri"] = uri;
                 }
+                else if (obj.TryGetPropertyValue("textDocument", out var tdNode) && tdNode is JsonObject tdObj &&
+                         tdObj.TryGetPropertyValue("uri", out var tdu) && tdu is JsonValue tuv && tuv.TryGetValue<string>(out var tus))
+                {
+                    // Resolve uri from nested textDocument even if it appears later in traversal.
+                    if (clientToServer) uri = GetGeneratedUri(tus);
+                    else uri = GetOriginalUri(tus);
+                }
 
                 // didOpen: replace text with generated content
                 if (clientToServer && obj.TryGetPropertyValue("text", out var textNode) && textNode is JsonValue tv && tv.TryGetValue<string>(out var originalText))
@@ -159,6 +235,61 @@ namespace CSX.LanguageServer
                                 Directory.CreateDirectory(Path.GetDirectoryName(genPath)!);
                                 File.WriteAllText(genPath, text);
                                 obj["text"] = text;
+                            }
+                            else
+                            {
+                                // transform the provided text directly
+                                var (t, _) = _transformer.TransformWithSourceMap(originalText);
+                                obj["text"] = t;
+                            }
+                        }
+                    }
+                    else if (uri != null && uri.EndsWith(_options.FileExtension, StringComparison.OrdinalIgnoreCase))
+                    {
+                        // fallback: transform provided text
+                        var (t, _) = _transformer.TransformWithSourceMap(originalText);
+                        obj["text"] = t;
+                    }
+                }
+
+                // didChange (full sync): transform each content change's text
+                if (clientToServer && obj.TryGetPropertyValue("contentChanges", out var ccNode) && ccNode is JsonArray ccArr)
+                {
+                    foreach (var item in ccArr)
+                    {
+                        if (item is not JsonObject co) continue;
+                        if (co.ContainsKey("range")) continue; // incremental; skip
+                        if (co.TryGetPropertyValue("text", out var tNode) && tNode is JsonValue tv2 && tv2.TryGetValue<string>(out var ct))
+                        {
+                            string? genText = null;
+                            SourceMap? genMap = null;
+                            if (uri != null && (uri.EndsWith(".generated.cs", StringComparison.OrdinalIgnoreCase) || uri.EndsWith(_options.FileExtension, StringComparison.OrdinalIgnoreCase)))
+                            {
+                                var (t, m) = _transformer.TransformWithSourceMap(ct);
+                                genText = t;
+                                genMap = m;
+                            }
+                            if (genText != null)
+                            {
+                                co["text"] = genText;
+                                // persist updated generated file + map for position mapping
+                                if (uri != null && uri.EndsWith(".generated.cs", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    try
+                                    {
+                                        var genPath = UriToPath(uri);
+                                        Directory.CreateDirectory(Path.GetDirectoryName(genPath)!);
+                                        File.WriteAllText(genPath, genText);
+                                        if (genMap != null)
+                                        {
+                                            genMap.SourceFile = GetOriginalPath(uri);
+                                            genMap.GeneratedFile = genPath;
+                                            File.WriteAllText(genPath + ".map", System.Text.Json.JsonSerializer.Serialize(genMap));
+                                        }
+                                        _resolver.Load(genPath);
+                                    }
+                                    catch { }
+                                }
                             }
                         }
                     }

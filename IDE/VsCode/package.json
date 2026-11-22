@@ -1,0 +1,111 @@
+{
+  "name": "csx-vscode",
+  "displayName": "CSX Language Support",
+  "description": "Language support for CSharpExtended (.cx) files",
+  "publisher": "donkeh",
+  "version": "0.0.1",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/donkeh/csx"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onLanguage:cx",
+    "onStartupFinished",
+    "workspaceContains:**/*.cx",
+    "onCommand:csx.startServer"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "cx",
+        "aliases": [
+          "CSX",
+          "cx"
+        ],
+        "extensions": [
+          ".cx"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "cx",
+        "scopeName": "source.cx",
+        "path": "./syntaxes/cx.tmLanguage.json"
+      }
+    ],
+    "commands": [
+      {
+        "command": "csx.startServer",
+        "title": "CSX: Start Language Server"
+      },
+      {
+        "command": "csx.restartServer",
+        "title": "CSX: Restart Language Server"
+      },
+      {
+        "command": "csx.showOutput",
+        "title": "CSX: Show Output"
+      }
+    ],
+    "configuration": {
+      "title": "CSX",
+      "properties": {
+        "csx.server.mode": {
+          "type": "string",
+          "enum": [
+            "installed",
+            "local"
+          ],
+          "default": "local",
+          "description": "Whether to use the installed 'csx' tool or a local project build."
+        },
+        "csx.server.path": {
+          "type": "string",
+          "default": "csx",
+          "description": "Path to the csx executable or 'dotnet' when using local mode."
+        },
+        "csx.server.args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "lang-server"
+          ],
+          "description": "Arguments passed to the language server."
+        },
+        "csx.local.projectPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to a local CSX.CliTool executable, dll, csproj, or directory. Leave empty to auto-detect a build in the workspace."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package",
+    "publish": "vsce publish",
+    "build": "node scripts/build.js"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.0",
+    "@vscode/vsce": "^3.0.0"
+  }
+}

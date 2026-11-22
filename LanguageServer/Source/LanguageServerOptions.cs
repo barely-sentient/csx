@@ -8,6 +8,8 @@ namespace CSX.LanguageServer
 
         public string? CSharpServerPath { get; set; }
 
+        public string? GeneratedProjectPath { get; set; }
+
         public string FileExtension { get; set; } = ".cx";
     }
 }

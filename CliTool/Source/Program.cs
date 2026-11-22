@@ -12,8 +12,7 @@ if (args.Length > 0 && args[0] == "lang-server")
 
     await using var server = new LanguageServer(options);
     await server.StartAsync();
-    Console.WriteLine("csx language server started");
-    await Task.Delay(Timeout.Infinite);
+    await server.RunAsync();
 }
 else
 {
