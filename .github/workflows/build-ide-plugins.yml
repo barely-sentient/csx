@@ -16,7 +16,7 @@ on:
 permissions:
   contents: read
 
-concurrency:u
+concurrency:
   group: ide-plugins-${{ github.ref }}
   cancel-in-progress: true
 
