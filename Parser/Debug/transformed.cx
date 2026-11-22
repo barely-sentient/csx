@@ -1,0 +1,103 @@
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+
+namespace Donkeh.Testing;
+
+public class User
+{
+    public int Id { get; set; }
+    public string Name { get; set; } = "";
+    public bool IsActive { get; set; }
+    public List<string> Roles { get; set; } = [];
+}
+
+public class UserRepository<T> where T : User
+{
+    private readonly Dictionary<int, T> _users = new();
+
+    public IEnumerable<T> GetAll()
+        => _users.Values;
+
+    public T? GetById<TKey>(TKey id, Func<T, TKey> selector)
+        where TKey : notnull
+        => _users.Values.FirstOrDefault(x =>
+            EqualityComparer<TKey>.Default.Equals(selector(x), id));
+
+    public Dictionary<TKey, List<T>> GroupBy<TKey>(
+        Func<T, TKey> selector)
+        where TKey : notnull
+        => _users.Values
+            .GroupBy(selector)
+            .ToDictionary(
+                x => x.Key,
+                x => x.ToList());
+
+    public void Add(T user)
+        => _users[user.Id] = user;
+}
+
+public class UserDashboard
+{
+    private readonly UserRepository<User> _repository = new();
+
+    public async Task<object> RenderAsync(
+        int selectedUserId,
+        Dictionary<string, List<User>> groupedUsers)
+    {
+        var users = _repository.GetAll()
+            .Where(x => x.IsActive)
+            .OrderBy(x => x.Name)
+            .ToList();
+
+        var selected = _repository.GetById(
+            selectedUserId,
+            x => x.Id);
+
+        var lookup = new Dictionary<
+            string,
+            List<(User User, int Score)>
+        >();
+
+        var result = users
+            .Select(x => (
+                User: x,
+                Roles: x.Roles.Where(r => r.Length > 3).ToList()
+            ))
+            .ToList();
+
+        var scores = new List<Dictionary<int, List<string>>>
+        {
+            new()
+        };
+
+        Func<User, bool> predicate = user =>
+            user.IsActive && user.Roles.Any();
+
+        string status = selected switch
+        {
+            { IsActive: true } => "Active",
+            { IsActive: false } => "Inactive",
+            null => "Not found"
+        };
+
+        var message = $"Found {users.Count} active users";
+
+        // JSX STARTS HERE
+
+        return
+        _.H("div", new() { className = "dashboard" }, _.H("header", new() { }, _.H("h1", new() { }, message), _.H("span", new() { }, status)), _.C("Loop", new() { over = users }, (user) =>
+                    _.C("UserCard", new() { user = user, active = predicate(user), roles = user.Roles })), _.C("Loop", new() { over = groupedUsers }, (group) =>
+                    _.H("section", new() { }, _.H("h2", new() { }, group.Key), _.C("Loop", new() { over = group.Value }, (user) =>
+                                _.H("div", new() { }, user.Name)))), selected is not null
+                ? _.C("UserCard", new() { user = selected })
+                : _.H("p", new() { }, "No user selected"), _.H("footer", new() { }, _.H("span", new() { }, users.Count), _.H("span", new() { }, lookup.Count), _.H("span", new() { }, result.Count), _.H("span", new() { }, scores.Count)));
+    }
+
+    public TOutput Transform<TInput, TOutput>(
+        TInput input,
+        Func<TInput, TOutput> converter)
+        => converter(input);
+}

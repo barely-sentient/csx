@@ -116,6 +116,21 @@ public class UserDashboard
                     </section>
                 }
             </Loop<Dictionary<string, List<User>>>>
+            
+            <Loop<
+                Dictionary<
+                    string,
+                    List<(User User, Dictionary<int, string> Metadata)>
+                >
+            > over={data}>
+                {(item) =>
+                    <Fragment>
+                        {item.Value.Select(x =>
+                            <span>{x.User.Name}</span>
+                        )}
+                    </Fragment>
+                }
+            </Loop<Dictionary<string, List<(User User, Dictionary<int, string> Metadata)>>>>
 
             {selected is not null
                 ? <UserCard<User> user={selected} />

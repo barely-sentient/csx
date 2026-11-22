@@ -9,6 +9,7 @@
 
     <ItemGroup>
         <ProjectReference Include="..\Source\CSX.Parser.csproj"/>
+        <ProjectReference Include="..\..\Transformer\Source\CSX.Transformer.csproj"/>
     </ItemGroup>
 
 </Project>
