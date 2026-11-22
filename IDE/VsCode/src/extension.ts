@@ -2,13 +2,14 @@ import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { execFileSync } from 'child_process';
+import { execFileSync, spawn } from 'child_process';
 
 let client: any | undefined;
 let output: vscode.OutputChannel | undefined;
 let status: vscode.StatusBarItem | undefined;
 let starting = false;
 let extensionPath = '';
+let settingsPanel: vscode.WebviewPanel | undefined;
 
 const logFile = path.join(os.tmpdir(), 'csx-extension.log');
 
@@ -130,11 +131,9 @@ function autoDetectLocalCli(root: string): string | undefined {
 
 function resolveLocalLaunch(setting: string, root: string): { command: string; args: string[] } | undefined {
     let target = setting?.trim();
-
     if (!target) {
         target = autoDetectLocalCli(root) ?? '';
     }
-
     if (!target) {
         return undefined;
     }
@@ -178,6 +177,31 @@ function resolveLocalLaunch(setting: string, root: string): { command: string; a
     return { command: target, args: ['lang-server'] };
 }
 
+function isCliInstalled(): boolean {
+    return commandExists('csx');
+}
+
+async function installCliTool(): Promise<boolean> {
+    log('installing CSX.CliTool from NuGet');
+    try {
+        await new Promise<void>((resolve, reject) => {
+            const proc = spawn('dotnet', ['tool', 'install', '-g', 'CSX.CliTool'], { stdio: 'pipe' });
+            let stderr = '';
+            proc.stderr?.on('data', (d: Buffer) => { stderr += d.toString(); });
+            proc.on('close', (code: number | null) => {
+                if (code === 0) resolve();
+                else reject(new Error(stderr || `exit code ${code}`));
+            });
+            proc.on('error', reject);
+        });
+        log('CSX.CliTool installed successfully');
+        return true;
+    } catch (err) {
+        log(`install failed: ${err}`);
+        return false;
+    }
+}
+
 async function getMode(): Promise<'local' | 'installed' | undefined> {
     const configuration = vscode.workspace.getConfiguration('csx');
     const inspected = configuration.inspect<'local' | 'installed'>('server.mode');
@@ -189,13 +213,13 @@ async function getMode(): Promise<'local' | 'installed' | undefined> {
     const choice = await vscode.window.showQuickPick(
         [
             {
-                label: '$(folder) Local build',
-                description: 'Use the CSX.CliTool built from this repository (recommended for development)',
+                label: '$(folder) Local build (dev mode)',
+                description: 'Use a CSX.CliTool built from this repository',
                 value: 'local' as const
             },
             {
                 label: '$(cloud-download) Installed tool',
-                description: 'Use the "csx" command from PATH',
+                description: 'Use the "csx" command from PATH (auto-downloads if missing)',
                 value: 'installed' as const
             }
         ],
@@ -258,6 +282,20 @@ async function startServer(): Promise<void> {
             command = launch.command;
             args = launch.args;
         } else {
+            // Installed mode: ensure the tool is available, auto-install if missing.
+            if (!isCliInstalled()) {
+                const install = await vscode.window.showInformationMessage(
+                    'CSX.CliTool is not installed. Install it now from NuGet?',
+                    'Install', 'Cancel'
+                );
+                if (install !== 'Install') {
+                    throw new Error('CSX.CliTool is not installed. Run "dotnet tool install -g CSX.CliTool" or switch to local mode.');
+                }
+                const ok = await installCliTool();
+                if (!ok || !isCliInstalled()) {
+                    throw new Error('Failed to install CSX.CliTool. Check the CSX output channel for details.');
+                }
+            }
             const configured = vscode.workspace.getConfiguration('csx').get<string>('server.path', 'csx');
             if (!commandExists(configured)) {
                 throw new Error(
@@ -311,11 +349,16 @@ async function startServer(): Promise<void> {
         log(`startServer ERROR: ${err instanceof Error ? err.stack ?? message : message}`);
         setStatus('$(error) CSX: error', message);
 
-        const action = await vscode.window.showErrorMessage(`CSX language server failed: ${message}`, 'Show Log', 'Open Settings');
+        const action = await vscode.window.showErrorMessage(`CSX language server failed: ${message}`, 'Show Log', 'Open Settings', 'Install Tool');
         if (action === 'Show Log') {
             output?.show(true);
         } else if (action === 'Open Settings') {
             await vscode.commands.executeCommand('workbench.action.openSettings', 'csx.');
+        } else if (action === 'Install Tool') {
+            const ok = await installCliTool();
+            if (ok) {
+                await startServer();
+            }
         }
     } finally {
         starting = false;
@@ -336,6 +379,138 @@ async function restartServer(): Promise<void> {
     await startServer();
 }
 
+function openSettingsPanel() {
+    if (settingsPanel) {
+        settingsPanel.reveal(vscode.ViewColumn.One);
+        return;
+    }
+
+    settingsPanel = vscode.window.createWebviewPanel(
+        'csxSettings',
+        'CSX Settings',
+        vscode.ViewColumn.One,
+        { enableScripts: true, retainContextWhenHidden: true }
+    );
+
+    const config = vscode.workspace.getConfiguration('csx');
+    const mode = config.get<string>('server.mode', 'local');
+    const localPath = config.get<string>('local.projectPath', '');
+    const installed = isCliInstalled();
+
+    settingsPanel.webview.html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<style>
+    body { font-family: var(--vscode-font-family); padding: 20px; color: var(--vscode-foreground); background: var(--vscode-editor-background); }
+    h1 { font-size: 1.4em; }
+    .section { margin-bottom: 24px; }
+    label { display: block; margin-bottom: 6px; font-weight: bold; }
+    input[type="text"] { width: 100%; padding: 6px; box-sizing: border-box; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); }
+    select { padding: 6px; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); }
+    button { padding: 8px 16px; margin-top: 8px; cursor: pointer; background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; }
+    button:hover { background: var(--vscode-button-hoverBackground); }
+    .status { margin-top: 8px; padding: 8px; border-radius: 4px; }
+    .status.ok { background: rgba(0,200,0,0.1); }
+    .status.err { background: rgba(200,0,0,0.1); }
+    .hidden { display: none; }
+</style>
+</head>
+<body>
+    <h1>CSX Settings</h1>
+
+    <div class="section">
+        <label for="mode">Server Mode</label>
+        <select id="mode">
+            <option value="installed" ${mode === 'installed' ? 'selected' : ''}>Installed tool (from NuGet)</option>
+            <option value="local" ${mode === 'local' ? 'selected' : ''}>Local build (dev mode)</option>
+        </select>
+    </div>
+
+    <div class="section" id="installedSection">
+        <label>Installed Tool Status</label>
+        <div id="installStatus" class="status ${installed ? 'ok' : 'err'}">
+            ${installed ? 'CSX.CliTool is installed and available on PATH.' : 'CSX.CliTool is NOT installed.'}
+        </div>
+        <button id="installBtn">Install / Update from NuGet</button>
+        <p style="font-size:0.9em;opacity:0.8;">Installs <code>CSX.CliTool</code> globally via <code>dotnet tool install -g CSX.CliTool</code>.<br>
+        Package: <a href="https://www.nuget.org/packages/CSX.CliTool/">nuget.org/packages/CSX.CliTool</a></p>
+    </div>
+
+    <div class="section ${mode === 'local' ? '' : 'hidden'}" id="localSection">
+        <label for="runtimePath">CSX Runtime Path (dev mode)</label>
+        <input type="text" id="runtimePath" value="${localPath}" placeholder="Path to CSX.CliTool.exe, .dll, .csproj, or directory" />
+        <p style="font-size:0.9em;opacity:0.8;">Point this at your local CSX.CliTool build output or project file.</p>
+    </div>
+
+    <button id="saveBtn">Save &amp; Restart Server</button>
+
+    <script>
+        const vscode = acquireVsCodeApi();
+        const modeSelect = document.getElementById('mode');
+        const installedSection = document.getElementById('installedSection');
+        const localSection = document.getElementById('localSection');
+        const runtimePath = document.getElementById('runtimePath');
+        const installBtn = document.getElementById('installBtn');
+        const installStatus = document.getElementById('installStatus');
+        const saveBtn = document.getElementById('saveBtn');
+
+        function updateSections() {
+            const m = modeSelect.value;
+            installedSection.classList.toggle('hidden', m !== 'installed');
+            localSection.classList.toggle('hidden', m !== 'local');
+        }
+        modeSelect.addEventListener('change', updateSections);
+
+        installBtn.addEventListener('click', () => {
+            installBtn.disabled = true;
+            installBtn.textContent = 'Installing...';
+            vscode.postMessage({ command: 'install' });
+        });
+
+        saveBtn.addEventListener('click', () => {
+            vscode.postMessage({
+                command: 'save',
+                mode: modeSelect.value,
+                runtimePath: runtimePath.value
+            });
+        });
+
+        window.addEventListener('message', (event) => {
+            const msg = event.data;
+            if (msg.command === 'installResult') {
+                installBtn.disabled = false;
+                installBtn.textContent = 'Install / Update from NuGet';
+                installStatus.textContent = msg.success ? 'CSX.CliTool is installed and available on PATH.' : 'Installation failed: ' + msg.error;
+                installStatus.className = 'status ' + (msg.success ? 'ok' : 'err');
+            }
+        });
+    </script>
+</body>
+</html>`;
+
+    settingsPanel.onDidDispose(() => { settingsPanel = undefined; });
+
+    settingsPanel.webview.onDidReceiveMessage(async (msg: any) => {
+        if (msg.command === 'install') {
+            const ok = await installCliTool();
+            settingsPanel?.webview.postMessage({
+                command: 'installResult',
+                success: ok && isCliInstalled(),
+                error: ok ? '' : 'See output channel for details.'
+            });
+        } else if (msg.command === 'save') {
+            const cfg = vscode.workspace.getConfiguration('csx');
+            await cfg.update('server.mode', msg.mode, vscode.ConfigurationTarget.Global);
+            if (msg.mode === 'local') {
+                await cfg.update('local.projectPath', msg.runtimePath, vscode.ConfigurationTarget.Global);
+            }
+            settingsPanel?.dispose();
+            await restartServer();
+        }
+    });
+}
+
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
     extensionPath = context.extensionPath;
 
@@ -353,7 +528,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     context.subscriptions.push(
         vscode.commands.registerCommand('csx.startServer', () => startServer()),
         vscode.commands.registerCommand('csx.restartServer', () => restartServer()),
-        vscode.commands.registerCommand('csx.showOutput', () => output?.show(true))
+        vscode.commands.registerCommand('csx.showOutput', () => output?.show(true)),
+        vscode.commands.registerCommand('csx.install', () => installCliTool().then(ok => {
+            if (ok) vscode.window.showInformationMessage('CSX.CliTool installed successfully.');
+            else vscode.window.showErrorMessage('Failed to install CSX.CliTool. Check the CSX output channel.');
+        })),
+        vscode.commands.registerCommand('csx.openSettings', () => openSettingsPanel())
     );
 
     const handleOpen = (document: vscode.TextDocument) => {
@@ -370,6 +550,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         void startServer();
     } else {
         log('activate: no cx document open yet');
+    }
+
+    // Auto-check: if installed mode and tool missing, prompt.
+    const mode = vscode.workspace.getConfiguration('csx').get<string>('server.mode', 'local');
+    if (mode === 'installed' && !isCliInstalled()) {
+        const action = await vscode.window.showWarningMessage(
+            'CSX.CliTool is not installed. Install it now?',
+            'Install', 'Open Settings', 'Ignore'
+        );
+        if (action === 'Install') {
+            const ok = await installCliTool();
+            if (ok) {
+                await startServer();
+            }
+        } else if (action === 'Open Settings') {
+            openSettingsPanel();
+        }
     }
 }
 

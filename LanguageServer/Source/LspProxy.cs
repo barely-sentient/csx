@@ -350,6 +350,10 @@ namespace CSX.LanguageServer
                     {
                         uri = origUri;
                     }
+                    else
+                    {
+                        Console.Error.WriteLine("ConvertPosition: id " + idInt + " not in _requestUris (count=" + _requestUris.Count + ")");
+                    }
                 }
 
                 // Track request uris for response mapping.
@@ -382,7 +386,7 @@ namespace CSX.LanguageServer
                             if (origPath != null && File.Exists(origPath))
                             {
                                 var source = File.ReadAllText(origPath);
-                                var (text, _) = _transformer.TransformWithSourceMap(source);
+                                var (text, _) = _transformer.TransformWithSourceMap(source, _options.TransformConfig);
                                 Directory.CreateDirectory(Path.GetDirectoryName(genPath)!);
                                 File.WriteAllText(genPath, text);
                                 obj["text"] = text;
@@ -390,7 +394,7 @@ namespace CSX.LanguageServer
                             else
                             {
                                 // transform the provided text directly
-                                var (t, _) = _transformer.TransformWithSourceMap(originalText);
+                                var (t, _) = _transformer.TransformWithSourceMap(originalText, _options.TransformConfig);
                                 obj["text"] = t;
                             }
                         }
@@ -416,7 +420,7 @@ namespace CSX.LanguageServer
                             SourceMap? genMap = null;
                             if (uri != null && (uri.EndsWith(".generated.cs", StringComparison.OrdinalIgnoreCase) || uri.EndsWith(_options.FileExtension, StringComparison.OrdinalIgnoreCase)))
                             {
-                                var (t, m) = _transformer.TransformWithSourceMap(ct);
+                                var (t, m) = _transformer.TransformWithSourceMap(ct, _options.TransformConfig);
                                 genText = t;
                                 genMap = m;
                             }
@@ -478,7 +482,7 @@ namespace CSX.LanguageServer
         // Helpers for URI mapping
         private void ConvertPosition(JsonObject pos, bool clientToServer, string? uri)
         {
-            if (uri == null) { Console.Error.WriteLine("ConvertPosition: uri null"); return; }
+            if (uri == null) return;
             if (!int.TryParse(pos["line"]?.ToString(), out var line)) return;
             if (!int.TryParse(pos["character"]?.ToString(), out var ch)) return;
             Console.Error.WriteLine($"ConvertPosition: {(clientToServer ? "C->S" : "S->C")} uri={uri} line={line} ch={ch}");

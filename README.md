@@ -29,3 +29,28 @@ dotnet run --project LanguageServer/Source/CSX.LanguageServer.csproj -- lang-ser
 ## Packages
 
 Published to NuGet on tag push (`v*`). See `.github/workflows/publish-nuget.yml`.
+
+## VS Code Extension
+
+Install the `donkeh.csx-vscode` extension. On first open of a `.cx` file you'll be prompted to choose:
+
+- **Local build (dev mode)**: point at your `CSX.CliTool` build output or csproj.
+- **Installed tool**: uses the `csx` command from PATH (auto-downloads from NuGet if missing).
+
+Open the settings panel via `CSX: Open Settings` to configure.
+
+## csx.json
+
+The language server auto-creates a `csx.json` in the project root if missing. This file configures the transformer:
+
+```json
+{
+  "FrameworkHtmlClass": "_",
+  "FrameworkHtmlClassMethod": "H",
+  "FrameworkComponentMethod": "C",
+  "FrameworkFragmentMethod": "F",
+  "GeneratedFileOutput": "obj/csx"
+}
+```
+
+Edit these values to match your UI framework's helper class and methods.

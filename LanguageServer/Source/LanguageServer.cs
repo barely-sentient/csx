@@ -29,6 +29,7 @@ namespace CSX.LanguageServer
         public async Task StartAsync(CancellationToken cancellationToken = default)
         {
             _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            await LoadOrCreateConfigAsync(_cts.Token).ConfigureAwait(false);
             await TransformAllAsync(_cts.Token).ConfigureAwait(false);
             await GenerateSyntheticProjectAsync(_cts.Token).ConfigureAwait(false);
 
@@ -230,6 +231,35 @@ namespace CSX.LanguageServer
             }
         }
 
+        private async Task LoadOrCreateConfigAsync(CancellationToken ct)
+        {
+            var root = _options.ProjectRoot;
+            var configPath = Path.Combine(root, "csx.json");
+            try
+            {
+                if (!File.Exists(configPath))
+                {
+                    var defaultConfig = new CSX.Transformer.TransformConfig();
+                    var json = System.Text.Json.JsonSerializer.Serialize(defaultConfig, new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
+                    await File.WriteAllTextAsync(configPath, json, ct).ConfigureAwait(false);
+                    Console.Error.WriteLine($"csx: created {configPath}");
+                }
+
+                var text = await File.ReadAllTextAsync(configPath, ct).ConfigureAwait(false);
+                var config = System.Text.Json.JsonSerializer.Deserialize<CSX.Transformer.TransformConfig>(text);
+                if (config != null)
+                {
+                    _options.TransformConfig = config;
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"csx: failed to load csx.json: {ex.Message}");
+                _options.TransformConfig ??= new CSX.Transformer.TransformConfig();
+            }
+            _options.TransformConfig ??= new CSX.Transformer.TransformConfig();
+        }
+
         private async Task TransformAllAsync(CancellationToken ct)
         {
             var root = _options.ProjectRoot;
@@ -248,7 +278,7 @@ namespace CSX.LanguageServer
                 {
                     var source = await File.ReadAllTextAsync(file, ct).ConfigureAwait(false);
                     var transformer = new CSX.Transformer.Transformer();
-                    var (text, map) = transformer.TransformWithSourceMap(source);
+                    var (text, map) = transformer.TransformWithSourceMap(source, _options.TransformConfig);
                     var relative = Path.GetRelativePath(root, file);
                     var outPath = Path.Combine(outputDir, relative + ".generated.cs");
                     Directory.CreateDirectory(Path.GetDirectoryName(outPath)!);

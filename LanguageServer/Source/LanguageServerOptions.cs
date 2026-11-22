@@ -10,6 +10,8 @@ namespace CSX.LanguageServer
 
         public string? GeneratedProjectPath { get; set; }
 
+        public CSX.Transformer.TransformConfig? TransformConfig { get; set; }
+
         public string FileExtension { get; set; } = ".cx";
     }
 }
