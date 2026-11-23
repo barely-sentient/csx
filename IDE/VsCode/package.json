@@ -21,6 +21,13 @@
     "onCommand:csx.startServer"
   ],
   "main": "./out/extension.js",
+  "configurationDefaults": {
+    "[cx]": {
+      "editor.quickSuggestions": { "other": "on", "comments": "on", "strings": "on" },
+      "editor.suggestOnTriggerCharacters": true,
+      "editor.wordBasedSuggestions": "off"
+    }
+  },
   "contributes": {
     "languages": [
       {

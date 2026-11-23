@@ -18,8 +18,6 @@ namespace CSX.LanguageServer
         public SourceMapEntry? FindGeneratedMapping(string generatedPath, int generatedOffset)
         {
             if (!_maps.TryGetValue(generatedPath, out var map)) return null;
-            // Mappings are added from the inside out (sub-mappings first, then the
-            // containing element), so the first match is the most specific one.
             foreach (var m in map.Mappings)
             {
                 if (generatedOffset >= m.GeneratedStart &&
@@ -35,9 +33,6 @@ namespace CSX.LanguageServer
         {
             var m = FindGeneratedMapping(generatedPath, generatedStart);
             if (m == null) return null;
-
-            // For transformed entries (different lengths), don't interpolate when the
-            // diagnostic starts at the generated marker - land on the original '<'.
             if (m.GeneratedLength != m.OriginalLength || m.OriginalLength == 1)
             {
                 int subOffset = generatedStart - m.GeneratedStart;
@@ -49,8 +44,6 @@ namespace CSX.LanguageServer
                 mapped = Math.Clamp(mapped, m.OriginalStart, m.OriginalStart + m.OriginalLength - 1);
                 return (mapped, Math.Min(Math.Max(generatedLength, 1), m.OriginalStart + m.OriginalLength - mapped));
             }
-
-            // Preserved entry: identity mapping (exact).
             int off = generatedStart - m.GeneratedStart;
             return (m.OriginalStart + off, Math.Min(Math.Max(generatedLength, 1), m.OriginalLength - off));
         }
@@ -58,36 +51,46 @@ namespace CSX.LanguageServer
         public int ToGenerated(string generatedPath, int originalOffset)
         {
             if (!_maps.TryGetValue(generatedPath, out var map)) return originalOffset;
+
+            // Prefer a mapping that actually contains the caret.
             foreach (var m in map.Mappings)
             {
+                if (m.OriginalLength <= 0) continue;
                 if (originalOffset >= m.OriginalStart && originalOffset < m.OriginalStart + m.OriginalLength)
                 {
                     if (m.GeneratedLength != m.OriginalLength)
                     {
-                        if (originalOffset == m.OriginalStart)
-                        {
-                            return m.GeneratedStart;
-                        }
+                        if (originalOffset == m.OriginalStart) return m.GeneratedStart;
                         int mapped = m.GeneratedStart + (int)Math.Round((double)(originalOffset - m.OriginalStart) / m.OriginalLength * m.GeneratedLength);
                         return Math.Clamp(mapped, m.GeneratedStart, m.GeneratedStart + m.GeneratedLength - 1);
                     }
-                    // Preserved entry: identity.
                     return m.GeneratedStart + (originalOffset - m.OriginalStart);
                 }
             }
 
-            // Nothing starts at this offset (e.g. the caret is directly after the last token of
-            // a tag, before an unmapped '>', or at end of file). Use the end of the preserved
-            // entry that finishes exactly here, so completion/hover land on the text just typed.
+            // The caret is past the last mapped token (e.g. directly after a '.', ')' or
+            // whitespace the transformer did not copy verbatim). Generated offsets are not
+            // comparable to original offsets, so land on the end of the nearest preceding
+            // mapped token instead of returning a meaningless raw offset.
+            SourceMapEntry? nearest = null;
+            int nearestEnd = -1;
             foreach (var m in map.Mappings)
             {
-                if (m.GeneratedLength == m.OriginalLength &&
-                    m.OriginalStart + m.OriginalLength == originalOffset)
+                if (m.OriginalLength <= 0) continue;
+                int originalEnd = m.OriginalStart + m.OriginalLength;
+                if (originalEnd <= originalOffset && originalEnd > nearestEnd)
                 {
-                    return m.GeneratedStart + m.GeneratedLength;
+                    nearest = m;
+                    nearestEnd = originalEnd;
                 }
             }
-            return originalOffset;
+
+            if (nearest != null)
+            {
+                return nearest.GeneratedStart + nearest.GeneratedLength;
+            }
+
+            return Math.Clamp(originalOffset, 0, Math.Max(0, map.Mappings.Count == 0 ? originalOffset : map.Mappings[0].GeneratedStart));
         }
     }
 }

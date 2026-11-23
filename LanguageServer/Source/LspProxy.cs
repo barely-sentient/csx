@@ -16,6 +16,7 @@ namespace CSX.LanguageServer
         private readonly System.Collections.Concurrent.ConcurrentDictionary<int, byte> _injectedIds = new();
         private System.Threading.Tasks.TaskCompletionSource<bool>? _projectReady;
         private readonly Dictionary<int, string> _requestUris = new();
+        private readonly Dictionary<int, string> _requestMethods = new();
         private readonly Dictionary<string, HashSet<string>> _diagnosticIdentifiers = new(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, HashSet<string>> _pendingDiagnosticRefreshes = new(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, int> _diagnosticGenerations = new(StringComparer.OrdinalIgnoreCase);
@@ -92,6 +93,10 @@ namespace CSX.LanguageServer
                                 {
                                     resp = JsonDocument.Parse("{\"jsonrpc\":\"2.0\",\"id\":" + rid2.GetRawText() + ",\"result\":[]}");
                                 }
+                                else
+                                {
+                                    resp = JsonDocument.Parse("{\"jsonrpc\":\"2.0\",\"id\":" + rid2.GetRawText() + ",\"result\":null}");
+                                }
                                 if (resp != null) await WriteMessageAsync(backendIn, resp, ct).ConfigureAwait(false);
                             }
                         }
@@ -101,37 +106,67 @@ namespace CSX.LanguageServer
                     if (!string.IsNullOrWhiteSpace(_options.GeneratedProjectPath) && File.Exists(_options.GeneratedProjectPath))
                     {
                         var projectUri = new Uri(_options.GeneratedProjectPath).AbsoluteUri;
+                        const string openProjectId = "csx-project-open";
                         var openProject = JsonDocument.Parse(
-                            "{\"jsonrpc\":\"2.0\",\"method\":\"project/open\",\"params\":{\"projects\":[\"" + projectUri + "\"]}}");
+                            "{\"jsonrpc\":\"2.0\",\"id\":\"" + openProjectId + "\",\"method\":\"project/open\",\"params\":{\"projects\":[\"" + projectUri + "\"]}}");
                         await WriteMessageAsync(backendIn, openProject, ct).ConfigureAwait(false);
 
-                        // Wait for projectInitializationComplete
-                        var pdeadline = DateTime.UtcNow.AddSeconds(5);
+                        // project/open is a REQUEST. Sent as a notification Roslyn silently ignores
+                        // it, so the synthetic project is never loaded and every document falls back
+                        // to a file-based program with no references (which breaks IntelliSense).
+                        // Wait for the response so the project is ready before documents arrive.
+                        var pdeadline = DateTime.UtcNow.AddSeconds(30);
                         while (DateTime.UtcNow < pdeadline && !ct.IsCancellationRequested)
                         {
                             var (timedOut, msg) = await ReadBackendAsync(backendOut, pdeadline - DateTime.UtcNow, ct).ConfigureAwait(false);
                             if (timedOut || msg == null) break;
-                            if (msg.RootElement.TryGetProperty("method", out var pm) && pm.GetString() == "workspace/projectInitializationComplete")
+
+                            if (msg.RootElement.TryGetProperty("method", out var pm))
                             {
+                                if (pm.GetString() == "workspace/projectInitializationComplete")
+                                {
+                                    _projectReady?.TrySetResult(true);
+                                    continue;
+                                }
+
+                                if (msg.RootElement.TryGetProperty("id", out var rid2))
+                                {
+                                    var method = pm.GetString();
+                                    JsonDocument? resp = null;
+                                    if (method == "workspace/configuration")
+                                    {
+                                        int cnt = 1;
+                                        if (msg.RootElement.TryGetProperty("params", out var p) && p.TryGetProperty("items", out var items) && items.ValueKind == JsonValueKind.Array)
+                                            cnt = items.GetArrayLength();
+                                        resp = JsonDocument.Parse("{\"jsonrpc\":\"2.0\",\"id\":" + rid2.GetRawText() + ",\"result\":[" + string.Join(",", Enumerable.Repeat("null", cnt)) + "]}");
+                                    }
+                                    else if (method == "workspace/workspaceFolders")
+                                    {
+                                        resp = JsonDocument.Parse("{\"jsonrpc\":\"2.0\",\"id\":" + rid2.GetRawText() + ",\"result\":[]}");
+                                    }
+                                    else
+                                    {
+                                        // Any other server->client request (client/registerCapability,
+                                        // etc.) must still be answered or the backend blocks and the
+                                        // project never finishes loading.
+                                        resp = JsonDocument.Parse("{\"jsonrpc\":\"2.0\",\"id\":" + rid2.GetRawText() + ",\"result\":null}");
+                                    }
+                                    if (resp != null) await WriteMessageAsync(backendIn, resp, ct).ConfigureAwait(false);
+                                }
+                                continue;
+                            }
+
+                            // Response to our internal project/open request: swallow it.
+                            if (msg.RootElement.TryGetProperty("id", out var responseId) &&
+                                responseId.ValueKind == JsonValueKind.String &&
+                                responseId.GetString() == openProjectId)
+                            {
+                                if (msg.RootElement.TryGetProperty("error", out var openError))
+                                {
+                                    Console.Error.WriteLine("csx: project/open failed: " + openError.GetRawText());
+                                }
                                 _projectReady?.TrySetResult(true);
                                 break;
-                            }
-                            if (msg.RootElement.TryGetProperty("method", out var m2) && msg.RootElement.TryGetProperty("id", out var rid2))
-                            {
-                                var method = m2.GetString();
-                                JsonDocument? resp = null;
-                                if (method == "workspace/configuration")
-                                {
-                                    int cnt = 1;
-                                    if (msg.RootElement.TryGetProperty("params", out var p) && p.TryGetProperty("items", out var items) && items.ValueKind == JsonValueKind.Array)
-                                        cnt = items.GetArrayLength();
-                                    resp = JsonDocument.Parse("{\"jsonrpc\":\"2.0\",\"id\":" + rid2.GetRawText() + ",\"result\":[" + string.Join(",", Enumerable.Repeat("null", cnt)) + "]}");
-                                }
-                                else if (method == "workspace/workspaceFolders")
-                                {
-                                    resp = JsonDocument.Parse("{\"jsonrpc\":\"2.0\",\"id\":" + rid2.GetRawText() + ",\"result\":[]}");
-                                }
-                                if (resp != null) await WriteMessageAsync(backendIn, resp, ct).ConfigureAwait(false);
                             }
                         }
                     }
@@ -239,8 +274,8 @@ namespace CSX.LanguageServer
 
                 try
                 {
-                    Console.Error.WriteLine("proxy: " + (clientToServer ? "C->S" : "S->C") + " " + (doc.RootElement.TryGetProperty("method", out var _mm) ? _mm.GetString() : "response id=" + (doc.RootElement.TryGetProperty("id", out var _ii) ? _ii.GetRawText() : "?")) + " | " + doc.RootElement.GetRawText().Substring(0, Math.Min(120, doc.RootElement.GetRawText().Length)));
                     var rewritten = RewriteMessage(doc, clientToServer, out var handledMethod);
+                    Console.Error.WriteLine("proxy: " + (clientToServer ? "C->S" : "S->C") + " " + (doc.RootElement.TryGetProperty("method", out var _mm) ? _mm.GetString() : "response id=" + (doc.RootElement.TryGetProperty("id", out var _ii) ? _ii.GetRawText() : "?")) + " | " + rewritten.RootElement.GetRawText().Substring(0, Math.Min(120, rewritten.RootElement.GetRawText().Length)));
                     if (clientToServer)
                     {
                         await WriteMessageAsync(output, rewritten, ct).ConfigureAwait(false);
@@ -250,17 +285,7 @@ namespace CSX.LanguageServer
                         await WriteClientMessageAsync(output, rewritten, ct).ConfigureAwait(false);
                     }
 
-                    // After the client signals initialized, open the generated project
-                    // in the C# backend so it provides full IntelliSense.
-                    if (clientToServer && handledMethod == "initialized" &&
-                        !string.IsNullOrWhiteSpace(_options.GeneratedProjectPath) &&
-                        File.Exists(_options.GeneratedProjectPath))
-                    {
-                        var projectUri = new Uri(_options.GeneratedProjectPath).AbsoluteUri;
-                        var openProject = JsonDocument.Parse(
-                            "{\"jsonrpc\":\"2.0\",\"method\":\"project/open\",\"params\":{\"projects\":[\"" + projectUri + "\"]}}");
-                        await WriteMessageAsync(output, openProject, ct).ConfigureAwait(false);
-                    }
+                    // The synthetic project was already opened during the handshake.
 
                     if (clientToServer &&
                         handledMethod == "textDocument/didSave" &&
@@ -460,6 +485,115 @@ namespace CSX.LanguageServer
             return true;
         }
 
+        private void TransformSemanticTokensResponse(JsonObject message, int requestId)
+        {
+            if (!message.TryGetPropertyValue("result", out var resultNode) || resultNode is not JsonObject result)
+            {
+                return;
+            }
+
+            if (!_requestUris.TryGetValue(requestId, out var originalUri) || string.IsNullOrEmpty(originalUri))
+            {
+                return;
+            }
+
+            var originalPath = UriToPath(originalUri);
+            if (!originalPath.EndsWith(_options.FileExtension, StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            var generatedPath = GetGeneratedPath(originalPath);
+            _resolver.Load(generatedPath);
+
+            string originalText = ReadOriginalText(originalPath);
+            string generatedText = NormalizeLineEndings(File.Exists(generatedPath) ? File.ReadAllText(generatedPath) : "");
+
+            if (result.TryGetPropertyValue("data", out var dataNode) && dataNode is JsonArray dataArr)
+            {
+                var data = new int[dataArr.Count];
+                for (int i = 0; i < dataArr.Count; i++)
+                {
+                    data[i] = dataArr[i]!.GetValue<int>();
+                }
+
+                var mapped = MapSemanticTokensData(generatedPath, generatedText, originalText, data);
+                var newArr = new JsonArray();
+                foreach (var value in mapped)
+                {
+                    newArr.Add(value);
+                }
+                result["data"] = newArr;
+            }
+        }
+
+        private int[] MapSemanticTokensData(string generatedPath, string generatedText, string originalText, int[] data)
+        {
+            var decoded = new List<(int Line, int Char, int Length, int Type, int Mods, int OrigOffset)>();
+
+            int lastLine = 0;
+            int lastStart = 0;
+            for (int i = 0; i + 4 < data.Length; i += 5)
+            {
+                int deltaLine = data[i];
+                int deltaStart = data[i + 1];
+                int length = data[i + 2];
+                int type = data[i + 3];
+                int mods = data[i + 4];
+
+                int line = lastLine + deltaLine;
+                int startChar = deltaLine == 0 ? lastStart + deltaStart : deltaStart;
+                lastLine = line;
+                lastStart = startChar;
+
+                int genOffset = PositionToOffset(generatedText, line, startChar);
+                var mapped = _resolver.ToOriginal(generatedPath, genOffset, Math.Max(1, length));
+                int origOffset;
+                int origLength;
+                if (mapped.HasValue)
+                {
+                    origOffset = mapped.Value.OriginalStart;
+                    origLength = mapped.Value.OriginalLength;
+                }
+                else
+                {
+                    origOffset = Math.Clamp(genOffset, 0, originalText.Length);
+                    origLength = Math.Max(1, length);
+                }
+
+                if (origOffset < 0) origOffset = 0;
+                if (origOffset > originalText.Length) continue;
+                if (origOffset + origLength > originalText.Length)
+                {
+                    origLength = originalText.Length - origOffset;
+                }
+                if (origLength <= 0) continue;
+
+                var (oLine, oChar) = OffsetToPosition(originalText, origOffset);
+                decoded.Add((oLine, oChar, origLength, type, mods, origOffset));
+            }
+
+            decoded.Sort((a, b) => a.OrigOffset.CompareTo(b.OrigOffset));
+
+            var result = new List<int>();
+            int prevLine = 0;
+            int prevChar = 0;
+            foreach (var token in decoded)
+            {
+                int deltaLine = token.Line - prevLine;
+                int deltaStart = deltaLine == 0 ? token.Char - prevChar : token.Char;
+                result.Add(deltaLine);
+                result.Add(deltaStart);
+                result.Add(token.Length);
+                result.Add(token.Type);
+                result.Add(token.Mods);
+                prevLine = token.Line;
+                prevChar = token.Char;
+            }
+
+            return result.ToArray();
+        }
+
         public static async Task<JsonDocument?> ReadMessageAsync(Stream stream, CancellationToken ct)
         {
             // Read headers
@@ -569,8 +703,12 @@ namespace CSX.LanguageServer
                         {
                             caps["textDocumentSync"] = 1;
                         }
-                        caps.Remove("semanticTokensProvider");
-                        caps["inlayHintProvider"] = false;
+                        if (caps["semanticTokensProvider"] is JsonObject semanticProvider)
+                        {
+                            semanticProvider["full"] = JsonValue.Create(true);
+                            semanticProvider.Remove("range");
+                            semanticProvider.Remove("delta");
+                        }
                     }
                 }
                 catch { }
@@ -608,7 +746,13 @@ namespace CSX.LanguageServer
                     messageObject["id"] is JsonValue responseIdNode &&
                     responseIdNode.TryGetValue<int>(out var responseId))
                 {
+                    if (_requestMethods.TryGetValue(responseId, out var reqMethod) &&
+                        reqMethod.StartsWith("textDocument/semanticTokens", StringComparison.Ordinal))
+                    {
+                        TransformSemanticTokensResponse(messageObject, responseId);
+                    }
                     _requestUris.Remove(responseId);
+                    _requestMethods.Remove(responseId);
                 }
             }
 
@@ -659,10 +803,6 @@ namespace CSX.LanguageServer
                     {
                         uri = origUri;
                     }
-                    else
-                    {
-                        Console.Error.WriteLine("ConvertPosition: id " + idInt + " not in _requestUris (count=" + _requestUris.Count + ")");
-                    }
                 }
 
                 if (clientToServer && obj.TryGetPropertyValue("id", out var ridNode) && ridNode is JsonValue ridv &&
@@ -676,6 +816,7 @@ namespace CSX.LanguageServer
                         reqUri = rtus;
                     }
                     if (reqUri != null) _requestUris[ridInt] = reqUri;
+                    if (methodName != null) _requestMethods[ridInt] = methodName;
                 }
 
                 if (clientToServer &&
@@ -694,7 +835,8 @@ namespace CSX.LanguageServer
                 }
 
                 // didOpen: always regenerate from the current source and nearest csx.json
-                if (clientToServer && obj.TryGetPropertyValue("text", out var textNode) && textNode is JsonValue tv && tv.TryGetValue<string>(out var originalText))
+                if (clientToServer && methodName == "textDocument/didOpen" &&
+                    obj.TryGetPropertyValue("text", out var textNode) && textNode is JsonValue tv && tv.TryGetValue<string>(out var originalText))
                 {
                     if (uri != null && uri.EndsWith(".generated.cs", StringComparison.OrdinalIgnoreCase))
                     {
@@ -719,7 +861,8 @@ namespace CSX.LanguageServer
                 }
 
                 // didChange (full sync): regenerate from the edited .cx text
-                if (clientToServer && obj.TryGetPropertyValue("contentChanges", out var ccNode) && ccNode is JsonArray ccArr)
+                if (clientToServer && methodName == "textDocument/didChange" &&
+                    obj.TryGetPropertyValue("contentChanges", out var ccNode) && ccNode is JsonArray ccArr)
                 {
                     foreach (var item in ccArr)
                     {
@@ -855,7 +998,6 @@ namespace CSX.LanguageServer
             if (uri == null) return;
             if (!int.TryParse(pos["line"]?.ToString(), out var line)) return;
             if (!int.TryParse(pos["character"]?.ToString(), out var ch)) return;
-            Console.Error.WriteLine($"ConvertPosition: {(clientToServer ? "C->S" : "S->C")} uri={uri} line={line} ch={ch}");
 
             string generatedPath;
             string originalPath;
@@ -888,11 +1030,20 @@ namespace CSX.LanguageServer
             }
             else
             {
-                var r = _resolver.ToOriginal(generatedPath, offset, 1);
-                mappedOffset = r?.OriginalStart ?? offset;
-                if (isRangeEnd && r != null && r.Value.OriginalLength > 1)
+                var mapping = _resolver.FindGeneratedMapping(generatedPath, offset);
+                bool collapsed = mapping != null && mapping.OriginalLength <= 1 && mapping.GeneratedLength > 1;
+                if (collapsed)
                 {
-                    mappedOffset = Math.Min(originalText.Length, r.Value.OriginalStart + r.Value.OriginalLength);
+                    mappedOffset = Math.Clamp(offset, 0, originalText.Length);
+                }
+                else
+                {
+                    var r = _resolver.ToOriginal(generatedPath, offset, 1);
+                    mappedOffset = r?.OriginalStart ?? offset;
+                    if (isRangeEnd && r != null && r.Value.OriginalLength > 1)
+                    {
+                        mappedOffset = Math.Min(originalText.Length, r.Value.OriginalStart + r.Value.OriginalLength);
+                    }
                 }
             }
 
@@ -924,7 +1075,8 @@ namespace CSX.LanguageServer
             string generatedText = NormalizeLineEndings(File.Exists(generatedPath) ? File.ReadAllText(generatedPath) : "");
 
             int generatedStart = PositionToOffset(generatedText, startLine, startChar);
-            int generatedEnd = Math.Max(generatedStart + 1, PositionToOffset(generatedText, endLine, endChar));
+            int generatedEnd = PositionToOffset(generatedText, endLine, endChar);
+            if (generatedEnd < generatedStart) generatedEnd = generatedStart;
 
             var mapping = _resolver.FindGeneratedMapping(generatedPath, generatedStart);
             int originalStart;
@@ -939,7 +1091,9 @@ namespace CSX.LanguageServer
                      mapping.GeneratedLength <= 0)
             {
                 originalStart = Math.Clamp(mapping.OriginalStart, 0, originalText.Length);
-                originalEnd = Math.Min(originalText.Length, originalStart + 1);
+                originalEnd = generatedEnd > generatedStart
+                    ? Math.Min(originalText.Length, originalStart + 1)
+                    : originalStart;
             }
             else
             {
@@ -949,32 +1103,43 @@ namespace CSX.LanguageServer
                     : 0;
                 originalStart = Math.Clamp(mapping.OriginalStart + startInEntry, 0, originalText.Length);
 
-                int generatedSpan = Math.Min(
-                    Math.Max(1, generatedEnd - generatedStart),
-                    Math.Max(1, mapping.GeneratedStart + mapping.GeneratedLength - generatedStart));
-                int originalSpan = preserved
-                    ? Math.Clamp(generatedSpan, 1, Math.Max(1, mapping.OriginalLength - startInEntry))
-                    : Math.Clamp(
-                        (int)Math.Round((double)generatedSpan / mapping.GeneratedLength * mapping.OriginalLength),
-                        1,
-                        mapping.OriginalLength);
-                originalEnd = Math.Min(originalText.Length, originalStart + originalSpan);
-
-                if (preserved)
+                int generatedSpan = generatedEnd - generatedStart;
+                if (generatedSpan == 0)
                 {
-                    var endMapping = _resolver.FindGeneratedMapping(generatedPath, generatedEnd - 1);
-                    if (endMapping != null && endMapping.GeneratedLength == endMapping.OriginalLength)
+                    // Zero-length ranges (e.g. completion insert positions) must stay zero-length.
+                    // Expanding them to one character can land on a '\\n' and produce an invalid
+                    // range whose end starts on the following line, which VS Code discards.
+                    originalEnd = originalStart;
+                }
+                else
+                {
+                    int boundedSpan = Math.Min(
+                        Math.Max(1, generatedSpan),
+                        Math.Max(1, mapping.GeneratedStart + mapping.GeneratedLength - generatedStart));
+                    int originalSpan = preserved
+                        ? Math.Clamp(boundedSpan, 1, Math.Max(1, mapping.OriginalLength - startInEntry))
+                        : Math.Clamp(
+                            (int)Math.Round((double)boundedSpan / mapping.GeneratedLength * mapping.OriginalLength),
+                            1,
+                            mapping.OriginalLength);
+                    originalEnd = Math.Min(originalText.Length, originalStart + originalSpan);
+
+                    if (preserved)
                     {
-                        int endInEntry = Math.Clamp(generatedEnd - endMapping.GeneratedStart, 1, endMapping.OriginalLength);
-                        var candidate = Math.Min(originalText.Length, endMapping.OriginalStart + endInEntry);
-                        if (candidate > originalStart) originalEnd = candidate;
+                        var endMapping = _resolver.FindGeneratedMapping(generatedPath, generatedEnd - 1);
+                        if (endMapping != null && endMapping.GeneratedLength == endMapping.OriginalLength)
+                        {
+                            int endInEntry = Math.Clamp(generatedEnd - endMapping.GeneratedStart, 1, endMapping.OriginalLength);
+                            var candidate = Math.Min(originalText.Length, endMapping.OriginalStart + endInEntry);
+                            if (candidate > originalStart) originalEnd = candidate;
+                        }
                     }
                 }
             }
 
-            if (originalEnd <= originalStart)
+            if (originalEnd < originalStart)
             {
-                originalEnd = Math.Min(originalText.Length, originalStart + 1);
+                originalEnd = originalStart;
             }
 
             var (mappedStartLine, mappedStartChar) = OffsetToPosition(originalText, originalStart);
