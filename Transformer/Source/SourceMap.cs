@@ -11,7 +11,7 @@ namespace CSX.Transformer
         public int OriginalLength { get; set; }
     }
 
-    public class SourceMapá
+    public class SourceMap
     {
         public string? SourceFile { get; set; }
 
