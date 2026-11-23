@@ -1,9 +1,11 @@
 package com.donkeh.csx.rider
 
+import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.project.guessProjectDir
 import com.intellij.openapi.vfs.VirtualFile
+import com.intellij.util.execution.ParametersListUtil
 import java.io.File
 
 data class CxLaunchCommand(val command: String, val arguments: List<String>)
@@ -16,15 +18,23 @@ class CxServerResolver(
     private val log = Logger.getInstance(CxServerResolver::class.java)
 
     fun resolve(): CxLaunchCommand? {
-        val settings = project.getService(CxSettings::class.java)
-        return when (settings.serverMode) {
+        val settings = ApplicationManager.getApplication().getService(CxSettings::class.java)
+        val launch = when (settings.serverMode) {
             CxSettings.MODE_LOCAL -> resolveLocal(settings.localProjectPath)
             CxSettings.MODE_INSTALLED -> resolveInstalled(settings.serverPath)
             else -> {
                 log.warn("Unknown CSX server mode: ${settings.serverMode}")
                 null
             }
-        }
+        } ?: return null
+
+        // Mirror VS Code's `csx.server.args` setting. The resolver puts `lang-server` at the
+        // end so it can be replaced by the user's argument list without touching dll/exe prefixes.
+        val args = launch.arguments.toMutableList()
+        if (args.lastOrNull() == "lang-server") args.removeAt(args.lastIndex)
+        val configured = ParametersListUtil.parse(settings.serverArgs)
+        args.addAll(if (configured.isEmpty()) listOf("lang-server") else configured)
+        return launch.copy(arguments = args)
     }
 
     /**

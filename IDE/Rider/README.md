@@ -32,10 +32,16 @@ The released plugin matching the installed CLI version can be installed with `cs
 
 ## Configuration
 
-Open **Settings | Languages & Frameworks | CSX** to choose how the language server is launched:
+Open **Settings | Languages & Frameworks | CSX** to choose how the language server is launched. Settings are global (like VS Code user settings) and stored in `csx-rider.xml`.
 
-- **Local build (development)**: point at `CSX.CliTool.exe`, `CSX.CliTool.dll`, `CSX.CliTool.csproj`, or the repository root. The plugin auto-detects a build under `CliTool/Source/bin/<Debug|Release>/net10.0/` when the path is left blank.
-- **Installed tool (csx on PATH)**: uses the `csx` command (override with the Server command field). Install with `dotnet tool install -g CSX.CliTool`.
+| Rider field | VS Code setting | Meaning |
+| --- | --- | --- |
+| Server mode | `csx.server.mode` | `Local build (development)` or `NuGet build (csx on PATH)` |
+| Server command | `csx.server.path` | Installed `csx` command; defaults to `csx` |
+| Server args | `csx.server.args` | Space-separated arguments; defaults to `lang-server` |
+| Local CSX path | `csx.local.projectPath` | `CSX.CliTool.exe`, `.dll`, `.csproj`, or its directory |
+
+The plugin auto-detects a build under `CliTool/Source/bin/<Debug|Release>/net10.0/` when **Local CSX path** is blank. Installed mode uses the NuGet global tool (`dotnet tool install -g CSX.CliTool`).
 
 The language server starts automatically when a `.cx` file is opened. You can also start/restart it from **Tools | Start CSX Language Server** / **Restart CSX Language Server**.
 
@@ -45,10 +51,11 @@ The language server starts automatically when a `.cx` file is opened. You can al
 src/main/kotlin/com/donkeh/csx/rider/
   CxLanguage.kt, CxFileType.kt, CxIcons.kt  - file type registration
   CxLexer.kt, CxTokenTypes.kt, CxSyntaxHighlighter.kt - syntax highlighting
-  CxSettings.kt, CxConfigurable.kt           - persistent settings and UI
+  CxSettings.kt, CxConfigurable.kt           - persistent global settings and UI
   CxServerResolver.kt                        - resolves the csx lang-server command
-  CxLspClientDescriptor.kt                   - LSP process descriptor
-  CxLspIntegrationProvider.kt                - LSP lifecycle integration
+  CxLspServerDescriptor.kt                   - LSP process descriptor
+  CxLspServerSupportProvider.kt              - LSP lifecycle integration
+  CxCompletionAutoPopupHandler.kt            - VS Code-style trigger-character popups
   CxServerActions.kt                         - start/restart actions
 src/main/resources/META-INF/plugin.xml       - plugin descriptor
 ```

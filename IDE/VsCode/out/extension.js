@@ -181,10 +181,10 @@ function resolveLocalLaunch(setting, root) {
         target = built;
     }
     if (target.endsWith('.exe')) {
-        return { command: target, args: ['lang-server'] };
+        return { command: target, args: [] };
     }
     if (target.endsWith('.dll')) {
-        return { command: 'dotnet', args: [target, 'lang-server'] };
+        return { command: 'dotnet', args: [target] };
     }
     // A directory: look for a built CLI inside it.
     try {
@@ -203,7 +203,7 @@ function resolveLocalLaunch(setting, root) {
         }
     }
     catch { /* ignore */ }
-    return { command: target, args: ['lang-server'] };
+    return { command: target, args: [] };
 }
 function isCliInstalled() {
     return commandExists('csx');
@@ -284,6 +284,10 @@ async function startServer() {
         log(`startServer: mode=${mode}`);
         const root = detectProjectRoot();
         log(`startServer: root=${root}`);
+        // Match Rider's `Server args` field: default to `lang-server`, but allow a full override.
+        const configuredArgs = vscode.workspace.getConfiguration('csx').get('server.args', ['lang-server']);
+        const langServerArgs = configuredArgs && configuredArgs.length > 0 ? configuredArgs : ['lang-server'];
+        log(`startServer: server.args=${JSON.stringify(langServerArgs)}`);
         let command;
         let args;
         if (mode === 'local') {
@@ -294,7 +298,7 @@ async function startServer() {
                 throw new Error('Could not find a local CSX.CliTool build. Set "csx.local.projectPath" to CSX.CliTool.exe, CSX.CliTool.dll, or CSX.CliTool.csproj.');
             }
             command = launch.command;
-            args = launch.args;
+            args = [...launch.args, ...langServerArgs];
         }
         else {
             // Installed mode: ensure the tool is available, auto-install if missing.
@@ -313,7 +317,7 @@ async function startServer() {
                 throw new Error(`"${configured}" was not found on PATH. Install it with "dotnet tool install -g CSX.CliTool" or switch "csx.server.mode" to "local".`);
             }
             command = configured;
-            args = ['lang-server'];
+            args = langServerArgs;
         }
         args = [...args, '--root', root];
         log(`startServer: launching ${command} ${args.map(a => JSON.stringify(a)).join(' ')}`);

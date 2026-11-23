@@ -151,10 +151,10 @@ function resolveLocalLaunch(setting: string, root: string): { command: string; a
     }
 
     if (target.endsWith('.exe')) {
-        return { command: target, args: ['lang-server'] };
+        return { command: target, args: [] };
     }
     if (target.endsWith('.dll')) {
-        return { command: 'dotnet', args: [target, 'lang-server'] };
+        return { command: 'dotnet', args: [target] };
     }
 
     // A directory: look for a built CLI inside it.
@@ -174,7 +174,7 @@ function resolveLocalLaunch(setting: string, root: string): { command: string; a
         }
     } catch { /* ignore */ }
 
-    return { command: target, args: ['lang-server'] };
+    return { command: target, args: [] };
 }
 
 function isCliInstalled(): boolean {
@@ -267,6 +267,11 @@ async function startServer(): Promise<void> {
         const root = detectProjectRoot();
         log(`startServer: root=${root}`);
 
+        // Match Rider's `Server args` field: default to `lang-server`, but allow a full override.
+        const configuredArgs = vscode.workspace.getConfiguration('csx').get<string[]>('server.args', ['lang-server']);
+        const langServerArgs = configuredArgs && configuredArgs.length > 0 ? configuredArgs : ['lang-server'];
+        log(`startServer: server.args=${JSON.stringify(langServerArgs)}`);
+
         let command: string;
         let args: string[];
 
@@ -280,7 +285,7 @@ async function startServer(): Promise<void> {
                 );
             }
             command = launch.command;
-            args = launch.args;
+            args = [...launch.args, ...langServerArgs];
         } else {
             // Installed mode: ensure the tool is available, auto-install if missing.
             if (!isCliInstalled()) {
@@ -303,7 +308,7 @@ async function startServer(): Promise<void> {
                 );
             }
             command = configured;
-            args = ['lang-server'];
+            args = langServerArgs;
         }
 
         args = [...args, '--root', root];

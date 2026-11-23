@@ -34,9 +34,10 @@
                 language="CSX"
                 implementationClass="com.donkeh.csx.rider.CxSyntaxHighlighter$Factory"/>
 
-        <completion.contributor
-                language="CSX"
-                implementationClass="com.donkeh.csx.rider.CxCompletionContributor"/>
+        <!-- Completion is provided by the LSP server only. A local fallback contributor
+             previously mixed document identifiers/keywords into the list and overrode the
+             prefix matcher inside JSX tags, which made results diverge from VS Code. -->
+        <typedHandler implementation="com.donkeh.csx.rider.CxCompletionAutoPopupHandler"/>
 
         <projectConfigurable
                 parentId="language"
