@@ -3,6 +3,7 @@ obj
 bin
 node_modules
 *.vsix
+.vscode
 
 # Rider plugin (Gradle) build outputs
 IDE/Rider/.gradle/

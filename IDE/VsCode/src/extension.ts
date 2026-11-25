@@ -15,8 +15,16 @@ const logFile = path.join(os.tmpdir(), 'csx-extension.log');
 
 function log(message: string) {
     const line = `[${new Date().toISOString()}] ${message}`;
-    try { output?.appendLine(line); } catch { /* ignore */ }
-    try { fs.appendFileSync(logFile, line + os.EOL); } catch { /* ignore */ }
+    try {
+        output?.appendLine(line);
+    } catch (error) {
+        console.error('[csx] failed to write to the CSX output channel:', error);
+    }
+    try {
+        fs.appendFileSync(logFile, line + os.EOL);
+    } catch (error) {
+        console.error(`[csx] failed to append to ${logFile}:`, error);
+    }
 }
 
 function commandExists(command: string): boolean {
@@ -27,7 +35,8 @@ function commandExists(command: string): boolean {
             execFileSync('which', [command], { stdio: 'ignore' });
         }
         return true;
-    } catch {
+    } catch (error) {
+        console.warn(`[csx] command lookup failed for '${command}':`, error);
         return false;
     }
 }
@@ -38,7 +47,9 @@ function firstExisting(candidates: string[]): string | undefined {
             if (candidate && fs.existsSync(candidate)) {
                 return candidate;
             }
-        } catch { /* ignore */ }
+        } catch (error) {
+            console.warn(`[csx] could not check path '${candidate}':`, error);
+        }
     }
     return undefined;
 }
@@ -172,7 +183,9 @@ function resolveLocalLaunch(setting: string, root: string): { command: string; a
                 return resolveLocalLaunch(built, root);
             }
         }
-    } catch { /* ignore */ }
+    } catch (error) {
+        console.warn('[csx] local CLI auto-detection failed:', error);
+    }
 
     return { command: target, args: [] };
 }

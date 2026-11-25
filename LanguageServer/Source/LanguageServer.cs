@@ -107,7 +107,10 @@ namespace CSX.LanguageServer
                     }
                 }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine("csx: failed while probing the VS Code extensions folder for Roslyn: " + ex);
+            }
 
             // Common explicit locations
             foreach (var p in new[]
@@ -169,7 +172,10 @@ namespace CSX.LanguageServer
                             if (!string.IsNullOrWhiteSpace(inc)) frameworkRefs.Add(inc!);
                         }
                     }
-                    catch { }
+                    catch (Exception ex)
+                    {
+                        Console.Error.WriteLine($"csx: could not read project file '{csproj}': {ex.Message}");
+                    }
                 }
 
                 var csprojPath = Path.Combine(projectDir, "CSX.Generated.csproj");
@@ -328,7 +334,14 @@ global using System.Threading.Tasks;
                 var stderr = process.StandardError.ReadToEndAsync();
                 if (!process.WaitForExit(120_000))
                 {
-                    try { process.Kill(entireProcessTree: true); } catch { }
+                    try
+                    {
+                        process.Kill(entireProcessTree: true);
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.Error.WriteLine("csx: could not kill the timed-out restore process: " + ex.Message);
+                    }
                     Console.Error.WriteLine("csx: synthetic project restore timed out");
                     return;
                 }
@@ -368,7 +381,14 @@ global using System.Threading.Tasks;
             if (_cts != null) _cts.Cancel();
             if (_runTask != null)
             {
-                try { await _runTask.ConfigureAwait(false); } catch (OperationCanceledException) { }
+                try
+                {
+                    await _runTask.ConfigureAwait(false);
+                }
+                catch (OperationCanceledException ex)
+                {
+                    Console.Error.WriteLine("csx: language server run loop stopped: " + ex.Message);
+                }
             }
             if (_csharpServer != null && !_csharpServer.HasExited)
             {
@@ -398,8 +418,9 @@ global using System.Threading.Tasks;
                 p.WaitForExit(2000);
                 return p.ExitCode == 0;
             }
-            catch
+            catch (Exception ex)
             {
+                Console.Error.WriteLine($"csx: could not check whether '{name}' is on PATH: {ex.Message}");
                 return false;
             }
         }
@@ -518,7 +539,10 @@ global using System.Threading.Tasks;
                     dir = dir.Parent;
                 }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"csx: failed to load csx.json for '{file}': {ex.Message}");
+            }
             return fallback ?? new TransformConfig();
         }
 
@@ -1005,8 +1029,9 @@ global using System.Threading.Tasks;
             {
                 return Path.GetDirectoryName(new Uri(uri).LocalPath);
             }
-            catch
+            catch (Exception ex)
             {
+                Console.Error.WriteLine($"csx: could not resolve a directory from URI '{uri}': {ex.Message}");
                 return null;
             }
         }
@@ -1025,8 +1050,9 @@ global using System.Threading.Tasks;
                 {
                     files = Directory.EnumerateFiles(directory);
                 }
-                catch
+                catch (Exception ex)
                 {
+                    Console.Error.WriteLine($"csx: could not enumerate files in '{directory}': {ex.Message}");
                     continue;
                 }
 
@@ -1044,8 +1070,9 @@ global using System.Threading.Tasks;
                 {
                     subdirectories = Directory.EnumerateDirectories(directory);
                 }
-                catch
+                catch (Exception ex)
                 {
+                    Console.Error.WriteLine($"csx: could not enumerate subdirectories in '{directory}': {ex.Message}");
                     continue;
                 }
 
@@ -1102,9 +1129,9 @@ global using System.Threading.Tasks;
                             new CSharpParseOptions(LanguageVersion.Preview),
                             path: file));
                     }
-                    catch
+                    catch (Exception ex)
                     {
-                        // Ignore unreadable files.
+                        Console.Error.WriteLine($"csx: could not parse source file '{file}': {ex.Message}");
                     }
                 }
             }
@@ -1142,14 +1169,17 @@ global using System.Threading.Tasks;
 
                     references.Add(MetadataReference.CreateFromFile(path));
                 }
-                catch (BadImageFormatException)
+                catch (BadImageFormatException ex)
                 {
+                    Console.Error.WriteLine($"csx: skipping metadata reference '{path}' (not a managed assembly): {ex.Message}");
                 }
-                catch (IOException)
+                catch (IOException ex)
                 {
+                    Console.Error.WriteLine($"csx: could not read metadata reference '{path}': {ex.Message}");
                 }
-                catch (UnauthorizedAccessException)
+                catch (UnauthorizedAccessException ex)
                 {
+                    Console.Error.WriteLine($"csx: access denied reading metadata reference '{path}': {ex.Message}");
                 }
             }
 
@@ -1178,8 +1208,9 @@ global using System.Threading.Tasks;
             {
                 return new Uri(uri).LocalPath;
             }
-            catch
+            catch (Exception ex)
             {
+                Console.Error.WriteLine($"csx: could not convert URI '{uri}' to a path: {ex.Message}");
                 return uri;
             }
         }
@@ -1324,12 +1355,42 @@ global using System.Threading.Tasks;
             if (insideTag)
             {
                 var inside = text.Substring(lastOpen, offset - lastOpen);
-                bool inAttributes = inside.Length > 1 && inside.Skip(1).Any(char.IsWhiteSpace);
-                if (inAttributes)
+                if (inside.StartsWith("</", StringComparison.Ordinal) || inside.IndexOf('{') >= 0)
                 {
-                    foreach (var attribute in AttributeNames)
+                    return items;
+                }
+
+                int nameStart = 0;
+                while (nameStart < inside.Length && char.IsWhiteSpace(inside[nameStart])) nameStart++;
+                int nameEnd = nameStart;
+                while (nameEnd < inside.Length && (char.IsLetterOrDigit(inside[nameEnd]) ||
+                                                   inside[nameEnd] == '_' || inside[nameEnd] == '.' ||
+                                                   inside[nameEnd] == ':'))
+                {
+                    nameEnd++;
+                }
+                string tagName = inside.Substring(nameStart, nameEnd - nameStart);
+                string rest = inside.Substring(nameEnd);
+                var components = ComponentDiscovery.Discover(
+                    _options.ProjectRoot, _options.OutputDirectory, _options.FileExtension);
+
+                if (tagName.Length > 0 && rest.Any(char.IsWhiteSpace) && rest.IndexOf('=') < 0)
+                {
+                    var component = components.FirstOrDefault(c =>
+                        string.Equals(c.Name, tagName, StringComparison.OrdinalIgnoreCase));
+                    if (component != null)
                     {
-                        items.Add(new CompletionItem(attribute, 10, "JSX attribute"));
+                        foreach (var prop in component.Props)
+                        {
+                            items.Add(new CompletionItem(prop, 10, $"{component.Name} prop"));
+                        }
+                    }
+                    else
+                    {
+                        foreach (var attribute in AttributeNames)
+                        {
+                            items.Add(new CompletionItem(attribute, 10, "JSX attribute"));
+                        }
                     }
                 }
                 else
@@ -1338,9 +1399,12 @@ global using System.Threading.Tasks;
                     {
                         items.Add(new CompletionItem(tag, 7, "HTML element"));
                     }
-                    foreach (var component in CollectComponentNames())
+                    foreach (var component in components)
                     {
-                        items.Add(new CompletionItem(component, 7, "CSX component"));
+                        items.Add(new CompletionItem(component.Name, 7,
+                            component.Props.Count > 0
+                                ? $"CSX component: props {string.Join(", ", component.Props)}"
+                                : "CSX component"));
                     }
                 }
             }
@@ -1548,16 +1612,16 @@ global using System.Threading.Tasks;
                                 names.Add(match.Groups[1].Value);
                             }
                         }
-                        catch
+                        catch (Exception ex)
                         {
-                            // Ignore unreadable files.
+                            Console.Error.WriteLine($"csx: could not scan component file '{file}': {ex.Message}");
                         }
                     }
                 }
             }
-            catch
+            catch (Exception ex)
             {
-                // Ignore project scan failures.
+                Console.Error.WriteLine($"csx: component scan failed under '{_options.ProjectRoot}': {ex.Message}");
             }
 
             _componentCache = names.OrderBy(name => name, StringComparer.Ordinal).ToList();

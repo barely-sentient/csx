@@ -21,6 +21,7 @@ namespace CSX.LanguageServer
         private readonly Dictionary<string, HashSet<string>> _pendingDiagnosticRefreshes = new(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, int> _diagnosticGenerations = new(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<int, (string Uri, string Identifier, int Generation)> _diagnosticRequests = new();
+        private readonly Dictionary<int, JsxCompletionContext> _jsxCompletions = new();
         private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _diagnosticRefreshRequests = new(StringComparer.Ordinal);
         private readonly object _rewriteLock = new();
         private readonly object _pendingReadLock = new();
@@ -274,6 +275,31 @@ namespace CSX.LanguageServer
 
                 try
                 {
+                    // VS Code resolves the selected item as the user arrows through the list.
+                    // Our JSX items carry no Roslyn `data`, and Roslyn's resolve handler throws
+                    // on them ("Unexpected null"), which makes VS Code close the suggest widget.
+                    // These items have nothing to resolve, so echo them straight back.
+                    if (clientToServer &&
+                        doc.RootElement.TryGetProperty("method", out var resolveMethod) &&
+                        resolveMethod.GetString() == "completionItem/resolve" &&
+                        doc.RootElement.TryGetProperty("id", out var resolveId) &&
+                        doc.RootElement.TryGetProperty("params", out var resolveItem) &&
+                        resolveItem.ValueKind == JsonValueKind.Object &&
+                        !resolveItem.TryGetProperty("data", out _))
+                    {
+                        var response = new JsonObject
+                        {
+                            ["jsonrpc"] = "2.0",
+                            ["id"] = JsonNode.Parse(resolveId.GetRawText()),
+                            ["result"] = JsonNode.Parse(resolveItem.GetRawText())
+                        };
+                        using var responseDoc = JsonDocument.Parse(response.ToJsonString());
+                        await WriteClientMessageAsync(clientOutput, responseDoc, ct).ConfigureAwait(false);
+                        Console.Error.WriteLine("csx: answered JSX completionItem/resolve locally");
+                        doc.Dispose();
+                        continue;
+                    }
+
                     var rewritten = RewriteMessage(doc, clientToServer, out var handledMethod);
                     Console.Error.WriteLine("proxy: " + (clientToServer ? "C->S" : "S->C") + " " + (doc.RootElement.TryGetProperty("method", out var _mm) ? _mm.GetString() : "response id=" + (doc.RootElement.TryGetProperty("id", out var _ii) ? _ii.GetRawText() : "?")) + " | " + rewritten.RootElement.GetRawText().Substring(0, Math.Min(120, rewritten.RootElement.GetRawText().Length)));
                     if (clientToServer)
@@ -655,6 +681,255 @@ namespace CSX.LanguageServer
             await stream.FlushAsync(ct).ConfigureAwait(false);
         }
 
+        private sealed record CompletionEntry(
+            [property: System.Text.Json.Serialization.JsonPropertyName("label")] string Label,
+            [property: System.Text.Json.Serialization.JsonPropertyName("kind")] int Kind,
+            [property: System.Text.Json.Serialization.JsonPropertyName("detail")] string Detail);
+
+        private sealed class JsxCompletionContext
+        {
+            public List<CompletionEntry> Items { get; } = new();
+        }
+
+        private static readonly string[] HtmlTags =
+        {
+            "div", "span", "p", "a", "button", "input", "label", "form", "ul", "ol", "li",
+            "table", "tr", "td", "th", "h1", "h2", "h3", "h4", "h5", "h6", "img", "section",
+            "header", "footer", "nav", "main", "article", "aside", "select", "option",
+            "textarea", "strong", "em", "small", "br", "hr", "Fragment"
+        };
+
+        private static readonly string[] HtmlAttributes =
+        {
+            "className", "id", "style", "key", "ref", "onClick", "onChange", "onInput",
+            "onSubmit", "disabled", "value", "type", "href", "src", "alt", "title",
+            "placeholder", "data-testid"
+        };
+
+        private void TrackJsxCompletion(JsonObject message, JsonNode node)
+        {
+            if (message["id"] is not JsonValue idNode || !idNode.TryGetValue<int>(out var id)) return;
+            if (node["params"] is not JsonObject parameters ||
+                parameters["textDocument"] is not JsonObject document ||
+                document["uri"] is not JsonValue uriNode ||
+                !uriNode.TryGetValue<string>(out var uri) ||
+                !uri.EndsWith(_options.FileExtension, StringComparison.OrdinalIgnoreCase) ||
+                parameters["position"] is not JsonObject position ||
+                !int.TryParse(position["line"]?.ToString(), out var line) ||
+                !int.TryParse(position["character"]?.ToString(), out var character))
+            {
+                return;
+            }
+
+            var context = BuildJsxCompletionContext(uri, line, character);
+            if (context != null)
+            {
+                _jsxCompletions[id] = context;
+            }
+        }
+
+        private JsxCompletionContext? BuildJsxCompletionContext(string uri, int line, int character)
+        {
+            var path = UriToPath(uri);
+            var text = ReadOriginalText(path);
+            int offset = PositionToOffset(text, line, character);
+
+            int lastOpen = offset > 0 ? text.LastIndexOf('<', offset - 1) : -1;
+            int lastClose = offset > 0 ? text.LastIndexOf('>', offset - 1) : -1;
+            if (lastOpen < 0 || lastOpen <= lastClose) return null;
+
+            string inside = text.Substring(lastOpen, offset - lastOpen);
+            if (inside.StartsWith("</", StringComparison.Ordinal) || inside.IndexOf('{') >= 0) return null;
+
+            int i = 1;
+            while (i < inside.Length && char.IsWhiteSpace(inside[i])) i++;
+            int nameStart = i;
+            while (i < inside.Length && (char.IsLetterOrDigit(inside[i]) || inside[i] == '_' ||
+                                         inside[i] == '.' || inside[i] == ':' || inside[i] == '-'))
+            {
+                i++;
+            }
+
+            // An empty tag name is normal: the user just typed '<'. Offer the tag list.
+            string tagName = inside.Substring(nameStart, i - nameStart);
+            string rest = inside.Substring(i);
+            // Inside an attribute value: let Roslyn handle the expression.
+            if (rest.IndexOf('=') >= 0) return null;
+
+            int prefixStart = offset;
+            while (prefixStart > 0 && (char.IsLetterOrDigit(text[prefixStart - 1]) ||
+                                       text[prefixStart - 1] == '_' || text[prefixStart - 1] == '-'))
+            {
+                prefixStart--;
+            }
+            string prefix = text.Substring(prefixStart, offset - prefixStart);
+
+            bool inAttributes = tagName.Length > 0 && rest.Any(char.IsWhiteSpace);
+            IEnumerable<string> candidates;
+            string detail;
+            if (inAttributes)
+            {
+                var component = ComponentDiscovery
+                    .Discover(_options.ProjectRoot, _options.OutputDirectory, _options.FileExtension)
+                    .FirstOrDefault(c => string.Equals(c.Name, tagName, StringComparison.OrdinalIgnoreCase));
+                candidates = component != null ? component.Props : HtmlAttributes;
+                detail = component != null ? $"{component.Name} prop" : "JSX attribute";
+            }
+            else
+            {
+                var components = ComponentDiscovery
+                    .Discover(_options.ProjectRoot, _options.OutputDirectory, _options.FileExtension);
+                candidates = HtmlTags.Concat(components.Select(c => c.Name));
+                detail = "Component or HTML element";
+            }
+
+            var context = new JsxCompletionContext();
+            foreach (var candidate in candidates
+                         .Where(c => prefix.Length == 0 || c.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                         .Distinct(StringComparer.Ordinal))
+            {
+                int kind = inAttributes
+                    ? 10 // Property
+                    : HtmlTags.Contains(candidate, StringComparer.OrdinalIgnoreCase)
+                        ? 14 // Keyword (HTML tag)
+                        : 7; // Class (component)
+                context.Items.Add(new CompletionEntry(candidate, kind, detail));
+            }
+            Console.Error.WriteLine(
+                $"csx: JSX completion tag='{tagName}' prefix='{prefix}' attributes={inAttributes} items={context.Items.Count}");
+            return context;
+        }
+
+        /// <summary>
+        /// Adds the JSX suggestions to whatever the native provider returned instead of replacing
+        /// it. Roslyn still owns C# completions; the proxy only contributes the JSX-specific items
+        /// Roslyn doesn't know about. Labels already present in the native result are skipped so
+        /// the client never shows the same suggestion twice.
+        /// </summary>
+        private static void MergeJsxCompletionItems(JsonObject response, JsxCompletionContext jsxContext)
+        {
+            if (response.ContainsKey("error"))
+            {
+                // A cancelled/failed request has no usable result to merge into.
+                return;
+            }
+
+            JsonArray items;
+            JsonObject? list = null;
+            if (response["result"] is JsonObject resultList && resultList["items"] is JsonArray listItems)
+            {
+                list = resultList;
+                items = listItems;
+            }
+            else if (response["result"] is JsonArray resultArray)
+            {
+                items = resultArray;
+            }
+            else
+            {
+                items = new JsonArray();
+            }
+
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var existing in items)
+            {
+                if (existing is JsonObject item &&
+                    item["label"] is JsonValue labelNode &&
+                    labelNode.TryGetValue<string>(out var label))
+                {
+                    seen.Add(label);
+                }
+            }
+
+            int added = 0;
+            foreach (var entry in jsxContext.Items)
+            {
+                if (!seen.Add(entry.Label)) continue;
+                var node = JsonSerializer.SerializeToNode(entry);
+                if (node != null)
+                {
+                    items.Add(node);
+                    added++;
+                }
+            }
+
+            Console.Error.WriteLine(
+                $"csx: JSX completion merged {added} item(s) into native result ({items.Count} total)");
+
+            // When the native result was already an array or a CompletionList, `items` is
+            // that same node and is already attached to the response. Reassigning it would
+            // try to give the node a second parent, which JsonNode rejects.
+            if (list == null && response["result"] is not JsonArray)
+            {
+                response["result"] = items;
+            }
+        }
+
+        /// <summary>
+        /// Source-map conversion treats 'range' and 'selectionRange' independently, so a mapped
+        /// selection can end up outside its symbol's full range and VS Code rejects the response.
+        /// Make containment true by construction: fix the full range, then copy it verbatim into
+        /// the selection range (a symbol whose selection is its whole range is perfectly valid).
+        /// </summary>
+        private static void ClampDocumentSymbols(JsonNode? node)
+        {
+            if (node is JsonArray array)
+            {
+                foreach (var item in array) ClampDocumentSymbols(item);
+                return;
+            }
+            if (node is not JsonObject symbol) return;
+
+            if (symbol["range"] is JsonObject range)
+            {
+                int rs = PositionKey(range["start"] as JsonObject);
+                int re = PositionKey(range["end"] as JsonObject);
+                if (re < rs) SetPositionKey(range["end"] as JsonObject, rs);
+                symbol["selectionRange"] = range.DeepClone();
+            }
+            else if (symbol["location"] is JsonObject location && location["range"] is JsonObject locationRange)
+            {
+                int ls = PositionKey(locationRange["start"] as JsonObject);
+                int le = PositionKey(locationRange["end"] as JsonObject);
+                if (le < ls) SetPositionKey(locationRange["end"] as JsonObject, ls);
+            }
+
+            if (symbol["children"] is JsonArray children)
+            {
+                foreach (var child in children) ClampDocumentSymbols(child);
+            }
+        }
+
+        private static bool LooksLikeDocumentSymbols(JsonNode? result)
+        {
+            if (result is not JsonArray array) return false;
+            foreach (var item in array)
+            {
+                if (item is JsonObject symbol &&
+                    symbol.ContainsKey("range") &&
+                    (symbol.ContainsKey("selectionRange") || symbol.ContainsKey("children")))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private static int PositionKey(JsonObject? position)
+        {
+            if (position == null) return 0;
+            int.TryParse(position["line"]?.ToString(), out var line);
+            int.TryParse(position["character"]?.ToString(), out var character);
+            return line * 100000 + character;
+        }
+
+        private static void SetPositionKey(JsonObject? position, int key)
+        {
+            if (position == null) return;
+            position["line"] = key / 100000;
+            position["character"] = key % 100000;
+        }
+
         private JsonDocument RewriteMessage(JsonDocument doc, bool clientToServer, out string? methodName)
         {
             lock (_rewriteLock)
@@ -684,14 +959,23 @@ namespace CSX.LanguageServer
                 _clientSupportsDiagnosticRefresh = HasDiagnosticRefreshSupport(node);
             }
 
+            if (clientToServer && methodName == "textDocument/completion" && node is JsonObject completionRequest)
+            {
+                TrackJsxCompletion(completionRequest, node);
+            }
+
             // Force full-document sync so the proxy can transform whole documents
             // instead of having to replay incremental edits.
             if (!clientToServer)
             {
                 try
                 {
-                    var caps = node["result"]?["capabilities"] as JsonObject;
-                    if (caps != null)
+                    // Only the initialize response has an object result with capabilities.
+                    // Guarding the shape avoids throwing on every other response (null results,
+                    // arrays, numbers) and keeps the log clean.
+                    if (node is JsonObject responseObject &&
+                        responseObject["result"] is JsonObject resultObject &&
+                        resultObject["capabilities"] is JsonObject caps)
                     {
                         var sync = caps["textDocumentSync"];
                         if (sync is JsonObject so)
@@ -709,9 +993,27 @@ namespace CSX.LanguageServer
                             semanticProvider.Remove("range");
                             semanticProvider.Remove("delta");
                         }
+
+                        // Roslyn doesn't advertise '<' as a completion trigger, so VS Code never
+                        // asks for completions when the user starts a JSX tag. Add the characters
+                        // CSX needs; our rewrite supplies the JSX items for those positions.
+                        var completionProvider = caps["completionProvider"] as JsonObject ?? new JsonObject();
+                        var triggers = completionProvider["triggerCharacters"] as JsonArray ?? new JsonArray();
+                        foreach (var trigger in new[] { "<", ">", ".", "\"", "'", " ", "=", "/", "{" })
+                        {
+                            if (!triggers.Any(t => t is JsonValue v && v.TryGetValue<string>(out var s) && s == trigger))
+                            {
+                                triggers.Add(trigger);
+                            }
+                        }
+                        completionProvider["triggerCharacters"] = triggers;
+                        caps["completionProvider"] = completionProvider;
                     }
                 }
-                catch { }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine("csx: failed to adjust initialize capabilities: " + ex);
+                }
             }
 
             if (methodName == "textDocument/hover" || methodName == "textDocument/completion")
@@ -720,6 +1022,17 @@ namespace CSX.LanguageServer
             }
 
             RewriteNode(node, clientToServer, null, methodName);
+
+            // Do this for every response that looks like a document-symbol list. Request-id
+            // tracking can be lost (cancellation, refresh storms), and a single bad symbol makes
+            // VS Code discard the whole response.
+            if (!clientToServer && node is JsonObject symbolResponse &&
+                !symbolResponse.ContainsKey("method") &&
+                LooksLikeDocumentSymbols(symbolResponse["result"]))
+            {
+                Console.Error.WriteLine("csx: normalizing document symbol ranges");
+                ClampDocumentSymbols(symbolResponse["result"]);
+            }
 
             if (node is JsonObject messageObject)
             {
@@ -746,11 +1059,26 @@ namespace CSX.LanguageServer
                     messageObject["id"] is JsonValue responseIdNode &&
                     responseIdNode.TryGetValue<int>(out var responseId))
                 {
-                    if (_requestMethods.TryGetValue(responseId, out var reqMethod) &&
-                        reqMethod.StartsWith("textDocument/semanticTokens", StringComparison.Ordinal))
+                    if (_requestMethods.TryGetValue(responseId, out var reqMethod))
                     {
-                        TransformSemanticTokensResponse(messageObject, responseId);
+                        if (reqMethod.StartsWith("textDocument/semanticTokens", StringComparison.Ordinal))
+                        {
+                            TransformSemanticTokensResponse(messageObject, responseId);
+                        }
+                        else if (reqMethod == "textDocument/documentSymbol")
+                        {
+                            // Mapped symbol ranges can end up smaller than their selection ranges;
+                            // VS Code rejects such symbols outright ("selectionRange must be
+                            // contained in fullRange"), so clamp them before forwarding.
+                            ClampDocumentSymbols(messageObject["result"]);
+                        }
                     }
+
+                    if (_jsxCompletions.Remove(responseId, out var jsxContext))
+                    {
+                        MergeJsxCompletionItems(messageObject, jsxContext);
+                    }
+
                     _requestUris.Remove(responseId);
                     _requestMethods.Remove(responseId);
                 }
@@ -1343,7 +1671,11 @@ namespace CSX.LanguageServer
                 }
                 return path;
             }
-            catch { return uri; }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"csx: could not convert URI '{uri}' to a path: {ex.Message}");
+                return uri;
+            }
         }
 
         private static string PathToUri(string path)

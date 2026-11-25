@@ -52,11 +52,15 @@ function log(message) {
     try {
         output?.appendLine(line);
     }
-    catch { /* ignore */ }
+    catch (error) {
+        console.error('[csx] failed to write to the CSX output channel:', error);
+    }
     try {
         fs.appendFileSync(logFile, line + os.EOL);
     }
-    catch { /* ignore */ }
+    catch (error) {
+        console.error(`[csx] failed to append to ${logFile}:`, error);
+    }
 }
 function commandExists(command) {
     try {
@@ -68,7 +72,8 @@ function commandExists(command) {
         }
         return true;
     }
-    catch {
+    catch (error) {
+        console.warn(`[csx] command lookup failed for '${command}':`, error);
         return false;
     }
 }
@@ -79,7 +84,9 @@ function firstExisting(candidates) {
                 return candidate;
             }
         }
-        catch { /* ignore */ }
+        catch (error) {
+            console.warn(`[csx] could not check path '${candidate}':`, error);
+        }
     }
     return undefined;
 }
@@ -202,7 +209,9 @@ function resolveLocalLaunch(setting, root) {
             }
         }
     }
-    catch { /* ignore */ }
+    catch (error) {
+        console.warn('[csx] local CLI auto-detection failed:', error);
+    }
     return { command: target, args: [] };
 }
 function isCliInstalled() {
