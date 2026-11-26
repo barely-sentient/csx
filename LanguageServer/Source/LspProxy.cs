@@ -1,6 +1,7 @@
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using CSX.Parser;
 using CSX.Transformer;
 
 namespace CSX.LanguageServer
@@ -22,6 +23,7 @@ namespace CSX.LanguageServer
         private readonly Dictionary<string, int> _diagnosticGenerations = new(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<int, (string Uri, string Identifier, int Generation)> _diagnosticRequests = new();
         private readonly Dictionary<int, JsxCompletionContext> _jsxCompletions = new();
+        private readonly Dictionary<int, UsingCompletionContext> _usingCompletions = new();
         private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _diagnosticRefreshRequests = new(StringComparer.Ordinal);
         private readonly object _rewriteLock = new();
         private readonly object _pendingReadLock = new();
@@ -295,7 +297,7 @@ namespace CSX.LanguageServer
                         };
                         using var responseDoc = JsonDocument.Parse(response.ToJsonString());
                         await WriteClientMessageAsync(clientOutput, responseDoc, ct).ConfigureAwait(false);
-                        Console.Error.WriteLine("csx: answered JSX completionItem/resolve locally");
+                        Console.Error.WriteLine("csx: answered local completionItem/resolve");
                         doc.Dispose();
                         continue;
                     }
@@ -691,6 +693,11 @@ namespace CSX.LanguageServer
             public List<CompletionEntry> Items { get; } = new();
         }
 
+        private sealed class UsingCompletionContext
+        {
+            public List<JsonObject> Items { get; } = new();
+        }
+
         private static readonly string[] HtmlTags =
         {
             "div", "span", "p", "a", "button", "input", "label", "form", "ul", "ol", "li",
@@ -705,6 +712,194 @@ namespace CSX.LanguageServer
             "onSubmit", "disabled", "value", "type", "href", "src", "alt", "title",
             "placeholder", "data-testid"
         };
+
+        /// <summary>
+        /// Adds namespace suggestions while the caret is inside a .cx using directive.
+        ///
+        /// Two things make this necessary. Roslyn returns no namespaces for completion requests
+        /// triggered by a space (the editor marks those as TriggerCharacter), so the request is
+        /// rewritten as Invoked. Roslyn also only exposes metadata namespaces in this position,
+        /// not namespaces declared by other project files, so those are merged in locally from
+        /// .cx/.cs sources and the configured InjectedUsings.
+        /// </summary>
+        private void TrackUsingCompletion(JsonObject message)
+        {
+            if (message["id"] is not JsonValue idNode || !idNode.TryGetValue<int>(out var id)) return;
+
+            var context = BuildUsingCompletionContext(message);
+            if (context != null && context.Items.Count > 0)
+            {
+                _usingCompletions[id] = context;
+            }
+        }
+
+        private UsingCompletionContext? BuildUsingCompletionContext(JsonObject request)
+        {
+            if (request["params"] is not JsonObject parameters ||
+                parameters["textDocument"] is not JsonObject document ||
+                document["uri"] is not JsonValue uriNode ||
+                !uriNode.TryGetValue<string>(out var uri) ||
+                !uri.EndsWith(_options.FileExtension, StringComparison.OrdinalIgnoreCase) ||
+                parameters["position"] is not JsonObject position ||
+                !int.TryParse(position["line"]?.ToString(), out var line) ||
+                !int.TryParse(position["character"]?.ToString(), out var character))
+            {
+                return null;
+            }
+
+            var path = UriToPath(uri);
+            var text = ReadOriginalText(path);
+            int offset = PositionToOffset(text, line, character);
+            if (!TryGetUsingKeyword(text, offset, out var usingToken) || usingToken == null)
+            {
+                return null;
+            }
+
+            if (parameters["context"] is JsonObject completionContext &&
+                int.TryParse(completionContext["triggerKind"]?.ToString(), out var triggerKind) &&
+                triggerKind == 2)
+            {
+                completionContext["triggerKind"] = 1;
+                completionContext.Remove("triggerCharacter");
+                Console.Error.WriteLine("csx: forwarding using-directive completion as invoked");
+            }
+
+            if (offset < usingToken.EndPosition) return null;
+
+            int pathStart = usingToken.EndPosition;
+            while (pathStart < offset && char.IsWhiteSpace(text[pathStart])) pathStart++;
+
+            string rest = text.Substring(pathStart, offset - pathStart);
+            string prefix = rest.Trim();
+            if (prefix.StartsWith("static", StringComparison.Ordinal) ||
+                prefix.Contains('=') ||
+                rest.Contains("//", StringComparison.Ordinal) ||
+                rest.Contains("/*", StringComparison.Ordinal) ||
+                prefix.Any(c => !(char.IsLetterOrDigit(c) || c == '_' || c == '.')))
+            {
+                return null;
+            }
+
+            var config = LanguageServer.LoadConfigForFile(path, _options.TransformConfig, _options.ProjectRoot);
+            var outputDirectory = string.IsNullOrWhiteSpace(config.GeneratedFileOutput)
+                ? _options.OutputDirectory
+                : config.GeneratedFileOutput!;
+            var namespaces = NamespaceDiscovery.Discover(
+                _options.ProjectRoot,
+                outputDirectory,
+                _options.FileExtension,
+                config.InjectedUsings);
+
+            // Match .NET's segment-by-segment using completion: `using My` offers `Components`
+            // for My.Components, and `using My.` offers the next segment rather than the whole
+            // dotted name.
+            int lastDot = prefix.LastIndexOf('.');
+            string basePrefix = lastDot >= 0 ? prefix.Substring(0, lastDot + 1) : "";
+            string segmentPrefix = lastDot >= 0 ? prefix.Substring(lastDot + 1) : prefix;
+            int segmentStart = pathStart + basePrefix.Length;
+            var start = OffsetToPosition(text, segmentStart);
+            var end = OffsetToPosition(text, offset);
+            var seenSegments = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var result = new UsingCompletionContext();
+            foreach (var ns in namespaces)
+            {
+                if (basePrefix.Length > 0 && !ns.StartsWith(basePrefix, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                string remainder = ns.Substring(basePrefix.Length);
+                if (remainder.Length == 0) continue;
+
+                int dot = remainder.IndexOf('.');
+                string segment = dot >= 0 ? remainder.Substring(0, dot) : remainder;
+                if (segmentPrefix.Length > 0 &&
+                    !segment.StartsWith(segmentPrefix, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+                if (!seenSegments.Add(segment)) continue;
+
+                result.Items.Add(CreateUsingCompletionItem(segment, start, end));
+            }
+
+            Console.Error.WriteLine(
+                $"csx: using completion prefix='{prefix}' items={result.Items.Count}");
+            return result;
+        }
+
+        private static JsonObject CreateUsingCompletionItem(
+            string label,
+            (int Line, int Character) start,
+            (int Line, int Character) end)
+        {
+            return new JsonObject
+            {
+                ["label"] = label,
+                ["kind"] = 9, // Namespace
+                ["detail"] = "CSX / project namespace",
+                ["sortText"] = label,
+                ["textEdit"] = new JsonObject
+                {
+                    ["range"] = new JsonObject
+                    {
+                        ["start"] = new JsonObject
+                        {
+                            ["line"] = start.Line,
+                            ["character"] = start.Character
+                        },
+                        ["end"] = new JsonObject
+                        {
+                            ["line"] = end.Line,
+                            ["character"] = end.Character
+                        }
+                    },
+                    ["newText"] = label
+                }
+            };
+        }
+
+        /// <summary>
+        /// Finds the `using` keyword whose directive contains the caret. A semicolon or brace
+        /// ends the directive, so completed usings and local using statements/blocks do not leak
+        /// into the next position.
+        /// </summary>
+        private static bool TryGetUsingKeyword(string text, int offset, out Token? usingToken)
+        {
+            usingToken = null;
+            if (offset <= 0) return false;
+            if (offset > text.Length) offset = text.Length;
+
+            List<Token> tokens;
+            try
+            {
+                tokens = Tokenizer.Tokenize(text);
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine("csx: could not inspect using completion context: " + ex.Message);
+                return false;
+            }
+
+            foreach (var token in tokens)
+            {
+                if (token.StartPosition >= offset) break;
+
+                if (token.Kind == TokenKind.Keyword && token.Text == "using")
+                {
+                    usingToken = token;
+                }
+                else if (usingToken != null &&
+                         (token.Kind == TokenKind.Semicolon ||
+                          token.Kind == TokenKind.OpenBrace ||
+                          token.Kind == TokenKind.CloseBrace))
+                {
+                    usingToken = null;
+                }
+            }
+
+            return usingToken != null;
+        }
 
         private void TrackJsxCompletion(JsonObject message, JsonNode node)
         {
@@ -866,6 +1061,62 @@ namespace CSX.LanguageServer
         }
 
         /// <summary>
+        /// Adds project and CSX configured namespaces to Roslyn's using-directive completion.
+        /// Native items win when both providers know the same namespace.
+        /// </summary>
+        private static void MergeUsingCompletionItems(JsonObject response, UsingCompletionContext usingContext)
+        {
+            if (response.ContainsKey("error"))
+            {
+                return;
+            }
+
+            JsonArray items;
+            JsonObject? list = null;
+            if (response["result"] is JsonObject resultList && resultList["items"] is JsonArray listItems)
+            {
+                list = resultList;
+                items = listItems;
+            }
+            else if (response["result"] is JsonArray resultArray)
+            {
+                items = resultArray;
+            }
+            else
+            {
+                items = new JsonArray();
+            }
+
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var existing in items)
+            {
+                if (existing is JsonObject item &&
+                    item["label"] is JsonValue labelNode &&
+                    labelNode.TryGetValue<string>(out var label))
+                {
+                    seen.Add(label);
+                }
+            }
+
+            int added = 0;
+            foreach (var item in usingContext.Items)
+            {
+                string label = item["label"]?.GetValue<string>() ?? "";
+                if (label.Length == 0 || !seen.Add(label)) continue;
+                items.Add(item);
+                added++;
+            }
+
+            Console.Error.WriteLine(
+                $"csx: using completion merged {added} item(s) into native result ({items.Count} total)");
+
+            if (list == null && response["result"] is not JsonArray)
+            {
+                response["result"] = items;
+            }
+        }
+
+        /// <summary>
         /// Source-map conversion treats 'range' and 'selectionRange' independently, so a mapped
         /// selection can end up outside its symbol's full range and VS Code rejects the response.
         /// Make containment true by construction: fix the full range, then copy it verbatim into
@@ -961,6 +1212,7 @@ namespace CSX.LanguageServer
 
             if (clientToServer && methodName == "textDocument/completion" && node is JsonObject completionRequest)
             {
+                TrackUsingCompletion(completionRequest);
                 TrackJsxCompletion(completionRequest, node);
             }
 
@@ -1072,6 +1324,11 @@ namespace CSX.LanguageServer
                             // contained in fullRange"), so clamp them before forwarding.
                             ClampDocumentSymbols(messageObject["result"]);
                         }
+                    }
+
+                    if (_usingCompletions.Remove(responseId, out var usingContext))
+                    {
+                        MergeUsingCompletionItems(messageObject, usingContext);
                     }
 
                     if (_jsxCompletions.Remove(responseId, out var jsxContext))
