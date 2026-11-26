@@ -41,6 +41,12 @@ namespace CSX.Transformer
             config ??= new TransformConfig();
             var sb = new StringBuilder();
             var map = new SourceMap { SourceFile = null, GeneratedFile = null };
+
+            // Injected usings have no original source counterpart, so they are written before
+            // any mapped text. Appending them first keeps every generated offset recorded below
+            // naturally shifted past the prefix.
+            sb.Append(BuildInjectedUsings(source, tokens, config.InjectedUsings));
+
             int i = 0;
             int pos = 0;
             int count = tokens.Count;
@@ -509,6 +515,148 @@ namespace CSX.Transformer
         {
             value = value.Trim();
             return Quote(value);
+        }
+
+        /// <summary>
+        /// Builds the prefix of `using` directives requested through
+        /// <see cref="TransformConfig.InjectedUsings"/>. Entries may be bare namespaces
+        /// ("System.Text") or complete directives ("using static System.Math;").
+        /// Directives already present in the source, and duplicates in the config, are skipped.
+        /// </summary>
+        private static string BuildInjectedUsings(string source, List<Token> tokens, string[]? injectedUsings)
+        {
+            if (injectedUsings == null || injectedUsings.Length == 0)
+                return "";
+
+            HashSet<string>? existing = null;
+            var added = new HashSet<string>(StringComparer.Ordinal);
+            var sb = new StringBuilder();
+
+            foreach (var raw in injectedUsings)
+            {
+                string? directive = NormalizeUsing(raw);
+                if (directive == null) continue;
+
+                string key = GetUsingKey(directive);
+                existing ??= CollectExistingUsingKeys(source, tokens);
+                if (existing.Contains(key)) continue;
+                if (!added.Add(key)) continue;
+
+                sb.Append(directive).Append('\n');
+            }
+
+            if (sb.Length > 0) sb.Append('\n');
+            return sb.ToString();
+        }
+
+        /// <summary>
+        /// Normalizes one configured import into a complete directive. Accepts either a
+        /// namespace name or an already-formed directive, with or without the trailing semicolon.
+        /// </summary>
+        private static string? NormalizeUsing(string? raw)
+        {
+            if (string.IsNullOrWhiteSpace(raw)) return null;
+
+            string value = CollapseWhitespace(raw.Trim());
+            if (value.EndsWith(';')) value = value.Substring(0, value.Length - 1).TrimEnd();
+            if (value.Length == 0) return null;
+
+            if (!value.StartsWith("using ", StringComparison.Ordinal) &&
+                !value.StartsWith("global using ", StringComparison.Ordinal))
+            {
+                value = "using " + value;
+            }
+
+            return value + ";";
+        }
+
+        /// <summary>
+        /// Reduces a directive to the imported namespace/alias so that a plain `using X;`
+        /// and a `global using X;` are treated as the same import.
+        /// </summary>
+        private static string GetUsingKey(string directive)
+        {
+            string value = directive.Trim();
+            if (value.EndsWith(';')) value = value.Substring(0, value.Length - 1).TrimEnd();
+            if (value.StartsWith("global ", StringComparison.Ordinal))
+                value = value.Substring("global ".Length).TrimStart();
+            if (value.StartsWith("using ", StringComparison.Ordinal))
+                value = value.Substring("using ".Length).TrimStart();
+            return value;
+        }
+
+        private static HashSet<string> CollectExistingUsingKeys(string source, List<Token> tokens)
+        {
+            var keys = new HashSet<string>(StringComparer.Ordinal);
+            int braceDepth = 0;
+
+            for (int i = 0; i < tokens.Count; i++)
+            {
+                var t = tokens[i];
+                if (t.Kind == TokenKind.OpenBrace)
+                {
+                    braceDepth++;
+                    continue;
+                }
+                if (t.Kind == TokenKind.CloseBrace)
+                {
+                    if (braceDepth > 0) braceDepth--;
+                    continue;
+                }
+
+                // Usings are only valid at file or namespace scope. Ignoring anything nested
+                // deeper also avoids mistaking local `using` statements for directives.
+                if (braceDepth > 1 || t.Kind != TokenKind.Keyword || t.Text != "using")
+                    continue;
+
+                int j = i + 1;
+                while (j < tokens.Count && tokens[j].Length == 0) j++;
+                if (j >= tokens.Count) break;
+
+                var first = tokens[j];
+                bool looksLikeDirective =
+                    first.Kind == TokenKind.Identifier ||
+                    (first.Kind == TokenKind.Keyword && first.Text == "static");
+                if (!looksLikeDirective) continue;
+
+                int end = -1;
+                for (int k = j; k < tokens.Count; k++)
+                {
+                    var u = tokens[k];
+                    if (u.Kind == TokenKind.OpenBrace || u.Kind == TokenKind.JsxOpenBracket) break;
+                    if (u.Kind == TokenKind.Semicolon)
+                    {
+                        end = u.StartPosition + u.Length;
+                        break;
+                    }
+                }
+
+                if (end <= t.StartPosition) continue;
+
+                string? directive = NormalizeUsing(source.Substring(t.StartPosition, end - t.StartPosition));
+                if (directive != null) keys.Add(GetUsingKey(directive));
+            }
+
+            return keys;
+        }
+
+        private static string CollapseWhitespace(string value)
+        {
+            var sb = new StringBuilder(value.Length);
+            bool pendingSpace = false;
+            foreach (char c in value)
+            {
+                if (char.IsWhiteSpace(c))
+                {
+                    pendingSpace = true;
+                    continue;
+                }
+
+                if (pendingSpace && sb.Length > 0) sb.Append(' ');
+                pendingSpace = false;
+                sb.Append(c);
+            }
+            return sb.ToString();
         }
 
         private static string NormalizeLineEndings(string source) =>

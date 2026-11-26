@@ -77,6 +77,73 @@ public class TransformerTests
     }
 
     [Fact]
+    public void InjectedUsingsArePrepended()
+    {
+        var cfg = new TransformConfig
+        {
+            InjectedUsings = ["System", "System.Collections.Generic"]
+        };
+        var result = new Transformer().Transform("var x = <div />;", cfg);
+        Assert.StartsWith("using System;\nusing System.Collections.Generic;\n\n", result);
+        Assert.Contains("_.H(\"div\", new() { })", result);
+    }
+
+    [Fact]
+    public void InjectedUsingsAcceptCompleteDirectives()
+    {
+        var cfg = new TransformConfig
+        {
+            InjectedUsings = ["using static System.Math;", "Alias = System.Text.StringBuilder"]
+        };
+        var result = new Transformer().Transform("var x = <div />;", cfg);
+        Assert.Contains("using static System.Math;", result);
+        Assert.Contains("using Alias = System.Text.StringBuilder;", result);
+    }
+
+    [Fact]
+    public void InjectedUsingsSkipExistingAndDuplicateImports()
+    {
+        var source = "using System;\nglobal using static System.Math;\n\nnamespace Sample;\n\nvar x = <div />;";
+        var cfg = new TransformConfig
+        {
+            InjectedUsings = ["System", "static System.Math", "System.Linq", "System.Linq", "", "  "]
+        };
+
+        var result = new Transformer().Transform(source, cfg);
+
+        Assert.Equal(1, CountOccurrences(result, "using System;"));
+        Assert.Equal(1, CountOccurrences(result, "using static System.Math;"));
+        Assert.Equal(1, CountOccurrences(result, "using System.Linq;"));
+    }
+
+    [Fact]
+    public void InjectedUsingsShiftSourceMap()
+    {
+        var cfg = new TransformConfig { InjectedUsings = ["System"] };
+        var source = "var x = <div />;";
+        var (text, map) = new Transformer().TransformWithSourceMap(source, cfg);
+
+        const string prefix = "using System;\n\n";
+        Assert.StartsWith(prefix, text);
+
+        var tagMapping = map.Mappings.Single(m => m.OriginalStart == 9 && m.OriginalLength == 3);
+        Assert.Equal("div", text.Substring(tagMapping.GeneratedStart, tagMapping.GeneratedLength));
+        Assert.True(tagMapping.GeneratedStart >= prefix.Length);
+    }
+
+    private static int CountOccurrences(string text, string value)
+    {
+        int count = 0;
+        int index = 0;
+        while ((index = text.IndexOf(value, index, StringComparison.Ordinal)) >= 0)
+        {
+            count++;
+            index += value.Length;
+        }
+        return count;
+    }
+
+    [Fact]
     public void PreservesSurroundingCode()
     {
         var source = "int x = 1;\nreturn <div />;\nint y = 2;";

@@ -56,8 +56,13 @@ The language server auto-creates a `csx.json` in the project root if missing. Th
   "FrameworkHtmlClassMethod": "H",
   "FrameworkComponentMethod": "C",
   "FrameworkFragmentMethod": "F",
-  "GeneratedFileOutput": "obj/csx"
+  "GeneratedFileOutput": "obj/csx",
+  "InjectedUsings": ["System", "System.Collections.Generic"]
 }
 ```
 
 Edit these values to match your UI framework's helper class and methods.
+
+`InjectedUsings` is prepended to every generated file. Entries may be bare namespaces
+(`"System.Text"`) or complete directives (`"using static System.Math;"`); imports that already
+exist in the source, and duplicate entries, are skipped.

@@ -11,7 +11,11 @@
     </PropertyGroup>
 
     <ItemGroup>
-        <ProjectReference Include="..\..\LanguageServer\Source\CSX.LanguageServer.csproj"/>
+        <ProjectReference Include="..\..\LanguageServer\Source\CSX.LanguageServer.csproj" />
+    </ItemGroup>
+
+    <ItemGroup>
+      <PackageReference Include="ModelContextProtocol" Version="2.4.0" />
     </ItemGroup>
 
 </Project>

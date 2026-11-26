@@ -11,5 +11,7 @@
         public string FrameworkFragmentMethod { get; set; } = "F";
 
         public string GeneratedFileOutput { get; set; } = "src/generated";
+        
+        public string[] InjectedUsings { get; set; } = Array.Empty<string>();
     }
 }
